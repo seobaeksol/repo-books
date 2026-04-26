@@ -6,22 +6,30 @@ import Database from "better-sqlite3";
 import {
   type BookChapter,
   type BookFilter,
+  type GenerationArtifact,
   type BookPart,
+  type GenerationChapterRun,
   type GenerationRun,
+  type ImportSyncSnapshotPayload,
+  type PatchUserProfilePayload,
   type PatchReadingStatePayload,
   type PatchUIStatePayload,
   type PostGenerationOutlinePayload,
   type PostTutorMessagePayload,
+  type PostUserProfilePayload,
   type ReadingState,
   type RepoBook,
+  type SyncSnapshot,
+  type SyncStatus,
   type TutorMessage,
   type TutorThread,
   type UIState,
+  type UserProfile,
   seedBooks,
   seedUiState
 } from "@repo-books/shared";
 import { buildRepoIndex } from "./generation/indexer.js";
-import { generationSteps, synthesizeRepoBook } from "./generation/synthesizer.js";
+import { generationSteps, synthesizeRepoBook, type SynthesisHooks } from "./generation/synthesizer.js";
 import { materializeRepository } from "./generation/source.js";
 
 type SqliteDatabase = Database.Database;
@@ -46,6 +54,17 @@ const parseJson = <T>(value: unknown, fallback: T): T => {
 const asString = (value: unknown) => String(value ?? "");
 const asNumber = (value: unknown) => Number(value ?? 0);
 
+export const defaultUserId = "local";
+const syncSchemaVersion = 1;
+
+const defaultUserProfile = (): UserProfile => ({
+  id: defaultUserId,
+  name: "Local reader",
+  color: "cyan",
+  createdAt: seedUiState.updatedAt,
+  updatedAt: seedUiState.updatedAt
+});
+
 export const openDatabase = (dbPath = defaultDbPath()) => {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
@@ -57,6 +76,24 @@ export const openDatabase = (dbPath = defaultDbPath()) => {
 
 export const migrate = (db: SqliteDatabase) => {
   db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      color TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_metadata (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      schema_version INTEGER NOT NULL,
+      active_user_id TEXT NOT NULL DEFAULT 'local' REFERENCES users(id) ON DELETE SET DEFAULT,
+      last_export_at TEXT,
+      last_import_at TEXT,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS books (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -96,19 +133,23 @@ export const migrate = (db: SqliteDatabase) => {
       sections_json TEXT NOT NULL,
       code_json TEXT NOT NULL,
       notes_json TEXT NOT NULL,
-      checkpoints_json TEXT NOT NULL
+      checkpoints_json TEXT NOT NULL,
+      chapter_body_json TEXT NOT NULL DEFAULT '{}'
     );
 
     CREATE TABLE IF NOT EXISTS reading_states (
-      book_id TEXT PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL DEFAULT 'local' REFERENCES users(id) ON DELETE CASCADE,
+      book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
       chapter_id TEXT NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
       progress_percent REAL NOT NULL,
       scroll_y REAL NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, book_id)
     );
 
     CREATE TABLE IF NOT EXISTS generation_runs (
       id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL DEFAULT 'local' REFERENCES users(id) ON DELETE CASCADE,
       book_id TEXT REFERENCES books(id) ON DELETE SET NULL,
       repo_url TEXT NOT NULL,
       branch TEXT NOT NULL,
@@ -118,12 +159,38 @@ export const migrate = (db: SqliteDatabase) => {
       progress REAL NOT NULL,
       steps_json TEXT NOT NULL,
       outline_json TEXT NOT NULL,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      error TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS generation_chapter_runs (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+      chapter_id TEXT NOT NULL,
+      sort_order INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL,
+      attempts INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      last_error TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS generation_artifacts (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+      chapter_id TEXT,
+      kind TEXT NOT NULL,
+      sort_order INTEGER NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS tutor_threads (
       id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL DEFAULT 'local' REFERENCES users(id) ON DELETE CASCADE,
       book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
       chapter_id TEXT NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
       title TEXT NOT NULL,
@@ -141,7 +208,8 @@ export const migrate = (db: SqliteDatabase) => {
     );
 
     CREATE TABLE IF NOT EXISTS ui_state (
-      id TEXT PRIMARY KEY,
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      id TEXT NOT NULL DEFAULT 'default',
       active_book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
       active_chapter_id TEXT REFERENCES chapters(id) ON DELETE SET NULL,
       view TEXT NOT NULL,
@@ -151,6 +219,109 @@ export const migrate = (db: SqliteDatabase) => {
       updated_at TEXT NOT NULL
     );
   `);
+  upsertUser(db, defaultUserProfile());
+  ensureSyncMetadata(db);
+  ensureColumn(db, "generation_runs", "payload_json", "TEXT NOT NULL DEFAULT '{}'");
+  ensureColumn(db, "generation_runs", "error", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "generation_runs", "user_id", "TEXT NOT NULL DEFAULT 'local'");
+  ensureColumn(db, "tutor_threads", "user_id", "TEXT NOT NULL DEFAULT 'local'");
+  ensureColumn(db, "chapters", "chapter_body_json", "TEXT NOT NULL DEFAULT '{}'");
+  ensureUserScopedStateTables(db);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_reading_states_user ON reading_states(user_id);
+    CREATE INDEX IF NOT EXISTS idx_generation_runs_user ON generation_runs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_generation_artifacts_run ON generation_artifacts(run_id, sort_order);
+    CREATE INDEX IF NOT EXISTS idx_tutor_threads_user_context ON tutor_threads(user_id, book_id, chapter_id);
+  `);
+};
+
+const ensureColumn = (db: SqliteDatabase, table: string, column: string, definition: string) => {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (rows.some((row) => row.name === column)) return;
+  db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+};
+
+const upsertUser = (db: SqliteDatabase, user: UserProfile) => {
+  db.prepare(
+    `INSERT INTO users (id, name, color, created_at, updated_at)
+     VALUES (@id, @name, @color, @createdAt, @updatedAt)
+     ON CONFLICT(id) DO UPDATE SET
+       name = excluded.name,
+       color = excluded.color,
+       updated_at = excluded.updated_at`
+  ).run(user);
+};
+
+const ensureSyncMetadata = (db: SqliteDatabase) => {
+  const existing = db.prepare("SELECT id FROM sync_metadata WHERE id = 'default'").get() as Row | undefined;
+  if (existing) return;
+
+  const timestamp = nowIso();
+  db.prepare(
+    `INSERT INTO sync_metadata (id, device_id, schema_version, active_user_id, last_export_at, last_import_at, updated_at)
+     VALUES ('default', ?, ?, ?, NULL, NULL, ?)`
+  ).run(`local-${randomUUID()}`, syncSchemaVersion, defaultUserId, timestamp);
+};
+
+const tableInfo = (db: SqliteDatabase, table: string) => db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string; pk: number }>;
+
+const ensureUserScopedStateTables = (db: SqliteDatabase) => {
+  const readingInfo = tableInfo(db, "reading_states");
+  const readingPk = readingInfo.filter((column) => column.pk > 0).sort((a, b) => a.pk - b.pk).map((column) => column.name);
+  if (readingPk.join(",") !== "user_id,book_id") {
+    const userIdExpression = readingInfo.some((column) => column.name === "user_id") ? "COALESCE(user_id, 'local')" : "'local'";
+    rebuildTable(db, `
+      ALTER TABLE reading_states RENAME TO reading_states_legacy;
+      CREATE TABLE reading_states (
+        user_id TEXT NOT NULL DEFAULT 'local' REFERENCES users(id) ON DELETE CASCADE,
+        book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        chapter_id TEXT NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+        progress_percent REAL NOT NULL,
+        scroll_y REAL NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, book_id)
+      );
+      INSERT OR REPLACE INTO reading_states (user_id, book_id, chapter_id, progress_percent, scroll_y, updated_at)
+      SELECT ${userIdExpression}, book_id, chapter_id, progress_percent, scroll_y, updated_at
+      FROM reading_states_legacy;
+      DROP TABLE reading_states_legacy;
+    `);
+  }
+
+  const uiInfo = tableInfo(db, "ui_state");
+  const uiPk = uiInfo.filter((column) => column.pk > 0).sort((a, b) => a.pk - b.pk).map((column) => column.name);
+  if (uiPk.join(",") !== "user_id") {
+    const userIdExpression = uiInfo.some((column) => column.name === "user_id") ? "COALESCE(user_id, 'local')" : "'local'";
+    rebuildTable(db, `
+      ALTER TABLE ui_state RENAME TO ui_state_legacy;
+      CREATE TABLE ui_state (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        id TEXT NOT NULL DEFAULT 'default',
+        active_book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        active_chapter_id TEXT REFERENCES chapters(id) ON DELETE SET NULL,
+        view TEXT NOT NULL,
+        focus INTEGER NOT NULL,
+        mobile_panel TEXT NOT NULL,
+        preferences_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT OR REPLACE INTO ui_state (
+        user_id, id, active_book_id, active_chapter_id, view, focus, mobile_panel, preferences_json, updated_at
+      )
+      SELECT ${userIdExpression}, 'default', active_book_id, active_chapter_id, view, focus, mobile_panel, preferences_json, updated_at
+      FROM ui_state_legacy;
+      DROP TABLE ui_state_legacy;
+    `);
+  }
+};
+
+const rebuildTable = (db: SqliteDatabase, sql: string) => {
+  db.pragma("foreign_keys = OFF");
+  try {
+    db.exec(sql);
+  } finally {
+    db.pragma("foreign_keys = ON");
+  }
 };
 
 export const createRepository = (db: SqliteDatabase) => {
@@ -160,21 +331,103 @@ export const createRepository = (db: SqliteDatabase) => {
     ) VALUES (
       @id, @title, @subtitle, @repo, @branch, @model, @updated, @status, @statusLabel, @accent, @progress, @currentChapterId
     )
+    ON CONFLICT(id) DO UPDATE SET
+      title = excluded.title,
+      subtitle = excluded.subtitle,
+      repo = excluded.repo,
+      branch = excluded.branch,
+      model = excluded.model,
+      updated = excluded.updated,
+      status = excluded.status,
+      status_label = excluded.status_label,
+      accent = excluded.accent,
+      progress = excluded.progress,
+      current_chapter_id = excluded.current_chapter_id
   `);
 
   const insertPart = db.prepare(`
     INSERT INTO parts (id, book_id, sort_order, title, summary)
     VALUES (@id, @bookId, @order, @title, @summary)
+    ON CONFLICT(id) DO UPDATE SET
+      book_id = excluded.book_id,
+      sort_order = excluded.sort_order,
+      title = excluded.title,
+      summary = excluded.summary
   `);
 
   const insertChapter = db.prepare(`
     INSERT INTO chapters (
       id, book_id, part_id, sort_order, number, title, subtitle, progress, status, estimated_minutes,
-      files_json, goals_json, sections_json, code_json, notes_json, checkpoints_json
+      files_json, goals_json, sections_json, code_json, notes_json, checkpoints_json, chapter_body_json
     ) VALUES (
       @id, @bookId, @partId, @order, @number, @title, @subtitle, @progress, @status, @estimatedMinutes,
-      @filesJson, @goalsJson, @sectionsJson, @codeJson, @notesJson, @checkpointsJson
+      @filesJson, @goalsJson, @sectionsJson, @codeJson, @notesJson, @checkpointsJson, @chapterBodyJson
     )
+    ON CONFLICT(id) DO UPDATE SET
+      book_id = excluded.book_id,
+      part_id = excluded.part_id,
+      sort_order = excluded.sort_order,
+      number = excluded.number,
+      title = excluded.title,
+      subtitle = excluded.subtitle,
+      progress = excluded.progress,
+      status = excluded.status,
+      estimated_minutes = excluded.estimated_minutes,
+      files_json = excluded.files_json,
+      goals_json = excluded.goals_json,
+      sections_json = excluded.sections_json,
+      code_json = excluded.code_json,
+      notes_json = excluded.notes_json,
+      checkpoints_json = excluded.checkpoints_json,
+      chapter_body_json = excluded.chapter_body_json
+  `);
+
+  const insertGenerationRun = db.prepare(`
+    INSERT INTO generation_runs (
+      id, user_id, book_id, repo_url, branch, model, context, status, progress, steps_json, outline_json, payload_json, error, created_at, updated_at
+    ) VALUES (
+      @id, @userId, @bookId, @repoUrl, @branch, @model, @context, @status, @progress, @stepsJson, @outlineJson, @payloadJson, @error, @createdAt, @updatedAt
+    )
+    ON CONFLICT(id) DO UPDATE SET
+      user_id = excluded.user_id,
+      book_id = excluded.book_id,
+      repo_url = excluded.repo_url,
+      branch = excluded.branch,
+      model = excluded.model,
+      context = excluded.context,
+      status = excluded.status,
+      progress = excluded.progress,
+      steps_json = excluded.steps_json,
+      outline_json = excluded.outline_json,
+      payload_json = excluded.payload_json,
+      error = excluded.error,
+      updated_at = excluded.updated_at
+  `);
+
+  const updateGenerationRun = db.prepare(`
+    UPDATE generation_runs SET
+      book_id = @bookId,
+      branch = @branch,
+      status = @status,
+      progress = @progress,
+      steps_json = @stepsJson,
+      outline_json = @outlineJson,
+      error = @error,
+      updated_at = @updatedAt
+    WHERE id = @id
+  `);
+
+  const insertGenerationChapterRun = db.prepare(`
+    INSERT INTO generation_chapter_runs (
+      id, run_id, chapter_id, sort_order, title, status, attempts, source, last_error, updated_at
+    ) VALUES (
+      @id, @runId, @chapterId, @order, @title, @status, @attempts, @source, @lastError, @updatedAt
+    )
+  `);
+
+  const insertGenerationArtifact = db.prepare(`
+    INSERT INTO generation_artifacts (id, run_id, chapter_id, kind, sort_order, payload_json, created_at)
+    VALUES (@id, @runId, @chapterId, @kind, @order, @payloadJson, @createdAt)
   `);
 
   const saveBook = db.transaction((book: RepoBook) => {
@@ -188,7 +441,8 @@ export const createRepository = (db: SqliteDatabase) => {
         sectionsJson: json(chapter.sections),
         codeJson: json(chapter.code),
         notesJson: json(chapter.notes),
-        checkpointsJson: json(chapter.checkpoints)
+        checkpointsJson: json(chapter.checkpoints),
+        chapterBodyJson: json(chapterBodyJson(chapter))
       });
     }
   });
@@ -205,60 +459,70 @@ export const createRepository = (db: SqliteDatabase) => {
       .all(bookId)
       .map((row) => mapChapter(row as Row));
 
-  const getBook = (bookId: string): RepoBook | null => {
+  const getBaseBook = (bookId: string): RepoBook | null => {
     const row = db.prepare("SELECT * FROM books WHERE id = ?").get(bookId) as Row | undefined;
     if (!row) return null;
     return mapBook(row, getParts(bookId), getChapters(bookId));
   };
 
-  const listBooks = (filter: BookFilter): RepoBook[] => {
+  const getBook = (bookId: string, userId = defaultUserId): RepoBook | null => {
+    const book = getBaseBook(bookId);
+    return book ? applyUserReadingState(book, userId) : null;
+  };
+
+  const listBooks = (filter: BookFilter, userId = defaultUserId): RepoBook[] => {
     const statusFilter = filter === "in_progress" ? "reading" : filter === "all" ? null : filter;
     const rows = statusFilter
       ? db.prepare("SELECT * FROM books WHERE status = ? ORDER BY rowid").all(statusFilter)
       : db.prepare("SELECT * FROM books ORDER BY rowid").all();
     return rows.map((row) => {
       const bookId = asString((row as Row).id);
-      return mapBook(row as Row, getParts(bookId), getChapters(bookId));
+      return applyUserReadingState(mapBook(row as Row, getParts(bookId), getChapters(bookId)), userId);
     });
   };
 
-  const getReadingState = (bookId: string): ReadingState | null => {
-    const row = db.prepare("SELECT * FROM reading_states WHERE book_id = ?").get(bookId) as Row | undefined;
-    return row ? mapReadingState(row) : null;
+  const getReadingState = (bookId: string, userId = defaultUserId): ReadingState | null => {
+    const row = db.prepare("SELECT * FROM reading_states WHERE user_id = ? AND book_id = ?").get(userId, bookId) as Row | undefined;
+    if (row) return mapReadingState(row);
+
+    const book = getBaseBook(bookId);
+    if (!book) return null;
+    const chapter = book.chapters.find((item) => item.id === book.currentChapterId) ?? book.chapters[0];
+    if (!chapter) return null;
+    const state: ReadingState = {
+      userId,
+      bookId,
+      chapterId: chapter.id,
+      progressPercent: chapter.progress,
+      scrollY: 0,
+      updatedAt: nowIso()
+    };
+    upsertReadingState(state);
+    return state;
   };
 
-  const saveReadingState = (bookId: string, payload: PatchReadingStatePayload): ReadingState => {
-    const book = getBook(bookId);
+  const saveReadingState = (bookId: string, payload: PatchReadingStatePayload, userId = defaultUserId): ReadingState => {
+    ensureUser(userId);
+    const book = getBaseBook(bookId);
     if (!book) throw new Error("BOOK_NOT_FOUND");
     if (!book.chapters.some((chapter) => chapter.id === payload.chapterId)) throw new Error("CHAPTER_NOT_FOUND");
 
     const updatedAt = nowIso();
-    db.prepare(
-      `INSERT INTO reading_states (book_id, chapter_id, progress_percent, scroll_y, updated_at)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(book_id) DO UPDATE SET
-         chapter_id = excluded.chapter_id,
-         progress_percent = excluded.progress_percent,
-         scroll_y = excluded.scroll_y,
-         updated_at = excluded.updated_at`
-    ).run(bookId, payload.chapterId, payload.progressPercent, payload.scrollY, updatedAt);
-    db.prepare("UPDATE books SET current_chapter_id = ?, progress = ?, updated = ? WHERE id = ?").run(
-      payload.chapterId,
-      payload.progressPercent,
-      "방금 전",
-      bookId
-    );
-    return { bookId, chapterId: payload.chapterId, progressPercent: payload.progressPercent, scrollY: payload.scrollY, updatedAt };
+    const state: ReadingState = { userId, bookId, chapterId: payload.chapterId, progressPercent: payload.progressPercent, scrollY: payload.scrollY, updatedAt };
+    upsertReadingState(state);
+    db.prepare("UPDATE books SET updated = ? WHERE id = ?").run("방금 전", bookId);
+    return state;
   };
 
-  const getUiState = (): UIState => {
-    const row = db.prepare("SELECT * FROM ui_state WHERE id = 'default'").get() as Row | undefined;
+  const getUiState = (userId = defaultUserId): UIState => {
+    ensureUserState(userId);
+    const row = db.prepare("SELECT * FROM ui_state WHERE user_id = ?").get(userId) as Row | undefined;
     if (!row) throw new Error("UI_STATE_NOT_FOUND");
     return mapUiState(row);
   };
 
-  const saveUiState = (payload: PatchUIStatePayload): UIState => {
-    const current = getUiState();
+  const saveUiState = (payload: PatchUIStatePayload, userId = defaultUserId): UIState => {
+    const current = getUiState(userId);
     const next: UIState = {
       ...current,
       ...payload,
@@ -275,7 +539,7 @@ export const createRepository = (db: SqliteDatabase) => {
         mobile_panel = @mobilePanel,
         preferences_json = @preferencesJson,
         updated_at = @updatedAt
-       WHERE id = 'default'`
+       WHERE user_id = @userId`
     ).run({
       ...next,
       focus: next.focus ? 1 : 0,
@@ -284,46 +548,291 @@ export const createRepository = (db: SqliteDatabase) => {
     return next;
   };
 
-  const createGenerationRun = (payload: PostGenerationOutlinePayload): { generationRun: GenerationRun; book: RepoBook } => {
+  const createGenerationRun = async (payload: PostGenerationOutlinePayload, userId = defaultUserId): Promise<{ generationRun: GenerationRun; book: RepoBook | null }> => {
+    ensureUser(userId);
     const timestamp = nowIso();
-    const source = materializeRepository(payload.repoUrl, payload.branch);
-    const index = buildRepoIndex(source);
-    const { book, outline } = synthesizeRepoBook(payload, index);
     const run: GenerationRun = {
       id: randomUUID(),
-      bookId: book.id,
+      userId,
+      bookId: null,
       repoUrl: payload.repoUrl,
-      branch: index.branch,
+      branch: payload.branch,
       model: payload.model,
       context: payload.context,
-      status: "complete",
-      progress: 100,
-      steps: generationSteps(index),
-      outline,
+      status: "queued",
+      progress: 0,
+      steps: pendingGenerationSteps(),
+      outline: [],
+      chapterRuns: [],
+      artifacts: [],
+      error: "",
       createdAt: timestamp,
       updatedAt: timestamp
     };
-    const save = db.transaction(() => {
-      saveBook(book);
-      db.prepare(
-        `INSERT INTO generation_runs (
-          id, book_id, repo_url, branch, model, context, status, progress, steps_json, outline_json, created_at, updated_at
-        ) VALUES (
-          @id, @bookId, @repoUrl, @branch, @model, @context, @status, @progress, @stepsJson, @outlineJson, @createdAt, @updatedAt
-        )`
-      ).run({ ...run, stepsJson: json(run.steps), outlineJson: json(run.outline) });
-      db.prepare(
-        `INSERT INTO reading_states (book_id, chapter_id, progress_percent, scroll_y, updated_at)
-         VALUES (?, ?, ?, ?, ?)`
-      ).run(book.id, book.currentChapterId, book.progress, 0, timestamp);
+    insertGenerationRun.run({
+      ...run,
+      stepsJson: json(run.steps),
+      outlineJson: json(run.outline),
+      payloadJson: json(payload)
     });
-    save();
-    return { generationRun: run, book };
+
+    if (payload.background) {
+      setTimeout(() => {
+        void processGenerationRun(run.id).catch(() => undefined);
+      }, 0);
+      return { generationRun: run, book: null };
+    }
+
+    return await processGenerationRun(run.id, userId);
   };
 
-  const listTutorThreads = (filters: { bookId?: string; chapterId?: string }): TutorThread[] => {
-    const clauses: string[] = [];
-    const values: string[] = [];
+  const getGenerationRun = (runId: string): GenerationRun | null => {
+    const row = db.prepare("SELECT * FROM generation_runs WHERE id = ?").get(runId) as Row | undefined;
+    if (!row) return null;
+    return mapGenerationRun(row, listGenerationChapterRuns(runId), listGenerationArtifacts(runId));
+  };
+
+  const listGenerationChapterRuns = (runId: string): GenerationChapterRun[] =>
+    db
+      .prepare("SELECT * FROM generation_chapter_runs WHERE run_id = ? ORDER BY sort_order")
+      .all(runId)
+      .map((row) => mapGenerationChapterRun(row as Row));
+
+  const listGenerationArtifacts = (runId: string): GenerationArtifact[] =>
+    db
+      .prepare("SELECT * FROM generation_artifacts WHERE run_id = ? ORDER BY sort_order, rowid")
+      .all(runId)
+      .map((row) => mapGenerationArtifact(row as Row));
+
+  const retryFailedGenerationChapters = (runId: string): { generationRun: GenerationRun; book: RepoBook | null; retried: number } => {
+    const run = getGenerationRun(runId);
+    if (!run) throw new Error("GENERATION_RUN_NOT_FOUND");
+    if (run.status === "queued" || run.status === "running") throw new Error("GENERATION_RUN_BUSY");
+
+    const failedChapters = run.chapterRuns.filter((chapter) => chapter.status === "failed");
+    if (failedChapters.length === 0) return { generationRun: run, book: run.bookId ? getBook(run.bookId, run.userId) : null, retried: 0 };
+
+    const timestamp = nowIso();
+    const book = run.bookId ? getBook(run.bookId, run.userId) : null;
+    const repairedBook = book ? repairBookChapters(book, new Set(failedChapters.map((chapter) => chapter.chapterId))) : null;
+    const retry = db.transaction(() => {
+      if (repairedBook) saveBook(repairedBook);
+      for (const [index, chapter] of failedChapters.entries()) {
+        db.prepare(
+          `UPDATE generation_chapter_runs SET
+            status = 'complete',
+            attempts = attempts + 1,
+            source = 'chapter repair retry',
+            last_error = NULL,
+            updated_at = ?
+           WHERE id = ?`
+        ).run(timestamp, chapter.id);
+        insertGenerationArtifact.run({
+          id: randomUUID(),
+          runId,
+          chapterId: chapter.chapterId,
+          kind: "chapter_retry_repair",
+          order: run.artifacts.length + index,
+          payloadJson: json({ title: chapter.title, repairedAt: timestamp, source: "retry-failed-chapters" }),
+          createdAt: timestamp
+        });
+      }
+      const current = getGenerationRun(runId);
+      if (!current) throw new Error("GENERATION_RUN_NOT_FOUND");
+      updateGenerationRunRecord({
+        ...current,
+        status: "complete",
+        progress: 100,
+        steps: current.steps.map((step) => (step.label === "챕터 수리" ? { ...step, state: "complete", detail: `${failedChapters.length} failed chapters repaired from stored evidence` } : step)),
+        error: "",
+        updatedAt: timestamp
+      });
+    });
+    retry();
+
+    const updated = getGenerationRun(runId);
+    if (!updated) throw new Error("GENERATION_RUN_NOT_FOUND");
+    return { generationRun: updated, book: updated.bookId ? getBook(updated.bookId, updated.userId) : null, retried: failedChapters.length };
+  };
+
+  const retryGenerationChapter = (runId: string, chapterId: string): { generationRun: GenerationRun; book: RepoBook | null; retried: number } => {
+    const run = getGenerationRun(runId);
+    if (!run) throw new Error("GENERATION_RUN_NOT_FOUND");
+    if (run.status === "queued" || run.status === "running") throw new Error("GENERATION_RUN_BUSY");
+
+    const chapter = run.chapterRuns.find((item) => item.chapterId === chapterId);
+    if (!chapter) throw new Error("CHAPTER_RUN_NOT_FOUND");
+
+    const timestamp = nowIso();
+    const book = run.bookId ? getBook(run.bookId, run.userId) : null;
+    const repairedBook = book ? repairBookChapters(book, new Set([chapterId])) : null;
+    const retry = db.transaction(() => {
+      if (repairedBook) saveBook(repairedBook);
+      db.prepare(
+        `UPDATE generation_chapter_runs SET
+          status = 'complete',
+          attempts = attempts + 1,
+          source = 'chapter repair retry',
+          last_error = NULL,
+          updated_at = ?
+         WHERE id = ?`
+      ).run(timestamp, chapter.id);
+      insertGenerationArtifact.run({
+        id: randomUUID(),
+        runId,
+        chapterId,
+        kind: "chapter_retry_repair",
+        order: run.artifacts.length,
+        payloadJson: json({ title: chapter.title, repairedAt: timestamp, source: "chapter-retry" }),
+        createdAt: timestamp
+      });
+
+      const current = getGenerationRun(runId);
+      if (!current) throw new Error("GENERATION_RUN_NOT_FOUND");
+      const remainingFailures = current.chapterRuns.filter((item) => item.chapterId !== chapterId && item.status === "failed").length;
+      updateGenerationRunRecord({
+        ...current,
+        status: remainingFailures === 0 ? "complete" : current.status,
+        progress: remainingFailures === 0 ? 100 : current.progress,
+        steps: current.steps.map((step) => (step.label === "챕터 수리" ? { ...step, state: remainingFailures === 0 ? "complete" : step.state, detail: `${chapter.title} repaired from stored evidence` } : step)),
+        error: remainingFailures === 0 ? "" : current.error,
+        updatedAt: timestamp
+      });
+    });
+    retry();
+
+    const updated = getGenerationRun(runId);
+    if (!updated) throw new Error("GENERATION_RUN_NOT_FOUND");
+    return { generationRun: updated, book: updated.bookId ? getBook(updated.bookId, updated.userId) : null, retried: 1 };
+  };
+
+  const processGenerationRun = async (runId: string, fallbackUserId = defaultUserId): Promise<{ generationRun: GenerationRun; book: RepoBook | null }> => {
+    const row = db.prepare("SELECT * FROM generation_runs WHERE id = ?").get(runId) as Row | undefined;
+    if (!row) throw new Error("GENERATION_RUN_NOT_FOUND");
+    const userId = asString(row.user_id) || fallbackUserId;
+    const payload = parseJson<PostGenerationOutlinePayload>(row.payload_json, {
+      repoUrl: asString(row.repo_url),
+      branch: asString(row.branch),
+      model: asString(row.model),
+      context: asString(row.context),
+      audience: "유지보수 가능한 junior developer",
+      depth: "balanced",
+      background: false
+    });
+    const startedAt = nowIso();
+    const startingRun = mapGenerationRun(row, listGenerationChapterRuns(runId), listGenerationArtifacts(runId));
+    updateGenerationRunRecord({
+      ...startingRun,
+      status: "running",
+      progress: 10,
+      steps: runningGenerationSteps(),
+      error: "",
+      updatedAt: startedAt
+    });
+    db.prepare("DELETE FROM generation_artifacts WHERE run_id = ?").run(runId);
+    let artifactOrder = 0;
+    const saveArtifact: NonNullable<SynthesisHooks["onArtifact"]> = (artifact) => {
+      insertGenerationArtifact.run({
+        id: randomUUID(),
+        runId,
+        chapterId: artifact.chapterId ?? null,
+        kind: artifact.kind,
+        order: artifactOrder,
+        payloadJson: json(artifact.payload),
+        createdAt: nowIso()
+      });
+      artifactOrder += 1;
+    };
+    const updateStage: NonNullable<SynthesisHooks["onStage"]> = (label, detail, progress) => {
+      const current = getGenerationRun(runId);
+      if (!current) return;
+      updateGenerationRunRecord({
+        ...current,
+        status: "running",
+        progress: Math.max(current.progress, Math.min(99, progress)),
+        steps: stagedGenerationSteps(label, detail),
+        error: "",
+        updatedAt: nowIso()
+      });
+    };
+
+    try {
+      updateStage("저장소 분석", "materializing repository and building index", 12);
+      const source = materializeRepository(payload.repoUrl, payload.branch);
+      const index = buildRepoIndex(source);
+      const { book, outline, prose, chapterProse } = await synthesizeRepoBook(payload, index, { onStage: updateStage, onArtifact: saveArtifact });
+      const timestamp = nowIso();
+      const chapterRuns: GenerationChapterRun[] = chapterProse.map((chapter) => ({
+        id: randomUUID(),
+        runId,
+        chapterId: chapter.chapterId,
+        order: chapter.order,
+        title: chapter.title,
+        status: chapter.status,
+        attempts: chapter.attempts,
+        source: chapter.source,
+        lastError: chapter.lastError,
+        updatedAt: timestamp
+      }));
+      const completedRun: GenerationRun = {
+        ...startingRun,
+        bookId: book.id,
+        branch: index.branch,
+        status: "complete",
+        progress: 100,
+        steps: generationSteps(index, prose),
+        outline,
+        chapterRuns,
+        error: "",
+        updatedAt: timestamp
+      };
+
+      const save = db.transaction(() => {
+        saveBook(book);
+        updateGenerationRunRecord(completedRun);
+        db.prepare("DELETE FROM generation_chapter_runs WHERE run_id = ?").run(runId);
+        for (const chapterRun of chapterRuns) insertGenerationChapterRun.run(chapterRun);
+        upsertReadingState({
+          userId,
+          bookId: book.id,
+          chapterId: book.currentChapterId,
+          progressPercent: book.progress,
+          scrollY: 0,
+          updatedAt: timestamp
+        });
+      });
+      save();
+
+      const generationRun = getGenerationRun(runId);
+      if (!generationRun) throw new Error("GENERATION_RUN_NOT_FOUND");
+      return { generationRun, book };
+    } catch (error) {
+      const failedAt = nowIso();
+      const current = getGenerationRun(runId) ?? startingRun;
+      updateGenerationRunRecord({
+        ...current,
+        status: "failed",
+        progress: Math.max(current.progress, 10),
+        steps: current.steps.map((step, index) => (index === 0 ? { ...step, state: "failed", detail: errorMessage(error) } : step)),
+        error: errorMessage(error),
+        updatedAt: failedAt
+      });
+      throw error;
+    }
+  };
+
+  const updateGenerationRunRecord = (run: GenerationRun) => {
+    updateGenerationRun.run({
+      ...run,
+      stepsJson: json(run.steps),
+      outlineJson: json(run.outline)
+    });
+  };
+
+  const listTutorThreads = (filters: { bookId?: string; chapterId?: string }, userId = defaultUserId): TutorThread[] => {
+    ensureUser(userId);
+    const clauses: string[] = ["user_id = ?"];
+    const values: string[] = [userId];
     if (filters.bookId) {
       clauses.push("book_id = ?");
       values.push(filters.bookId);
@@ -335,7 +844,7 @@ export const createRepository = (db: SqliteDatabase) => {
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = db.prepare(`SELECT * FROM tutor_threads ${where} ORDER BY updated_at DESC`).all(...values) as Row[];
     if (rows.length === 0 && filters.bookId && filters.chapterId) {
-      return [createDefaultTutorThread(filters.bookId, filters.chapterId)];
+      return [createDefaultTutorThread(filters.bookId, filters.chapterId, userId)];
     }
     return rows.map((row) => mapTutorThread(row, listTutorMessages(asString(row.id))));
   };
@@ -346,8 +855,8 @@ export const createRepository = (db: SqliteDatabase) => {
       .all(threadId)
       .map((row) => mapTutorMessage(row as Row));
 
-  const appendTutorMessage = (threadId: string, payload: PostTutorMessagePayload): TutorThread => {
-    const thread = db.prepare("SELECT * FROM tutor_threads WHERE id = ?").get(threadId) as Row | undefined;
+  const appendTutorMessage = (threadId: string, payload: PostTutorMessagePayload, userId = defaultUserId): TutorThread => {
+    const thread = db.prepare("SELECT * FROM tutor_threads WHERE id = ? AND user_id = ?").get(threadId, userId) as Row | undefined;
     if (!thread) throw new Error("THREAD_NOT_FOUND");
 
     const createdAt = nowIso();
@@ -376,26 +885,158 @@ export const createRepository = (db: SqliteDatabase) => {
     return mapTutorThread(updatedThread, listTutorMessages(threadId));
   };
 
+  const listUsers = (): UserProfile[] =>
+    db
+      .prepare("SELECT * FROM users ORDER BY rowid")
+      .all()
+      .map((row) => mapUserProfile(row as Row));
+
+  const ensureUser = (userId = defaultUserId): UserProfile => {
+    const row = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as Row | undefined;
+    if (row) return mapUserProfile(row);
+
+    const timestamp = nowIso();
+    const user: UserProfile = {
+      id: userId,
+      name: userId === defaultUserId ? "Local reader" : userId,
+      color: userId === defaultUserId ? "cyan" : "slate",
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    upsertUser(db, user);
+    ensureUserState(userId);
+    return user;
+  };
+
+  const createUser = (payload: PostUserProfilePayload): UserProfile => {
+    const timestamp = nowIso();
+    const user: UserProfile = {
+      id: payload.id ?? randomUUID(),
+      name: payload.name ?? payload.displayName ?? "Reader",
+      color: payload.color,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    upsertUser(db, user);
+    ensureUserState(user.id);
+    return user;
+  };
+
+  const updateUser = (userId: string, payload: PatchUserProfilePayload): UserProfile => {
+    const current = ensureUser(userId);
+    const updated: UserProfile = {
+      ...current,
+      ...payload,
+      name: payload.name ?? payload.displayName ?? current.name,
+      updatedAt: nowIso()
+    };
+    upsertUser(db, updated);
+    return updated;
+  };
+
+  const getSyncStatus = (): SyncStatus => {
+    ensureSyncMetadata(db);
+    const row = db.prepare("SELECT * FROM sync_metadata WHERE id = 'default'").get() as Row | undefined;
+    if (!row) throw new Error("SYNC_STATUS_NOT_FOUND");
+    return mapSyncStatus(row);
+  };
+
+  const activateUser = (userId: string): { user: UserProfile; syncStatus: SyncStatus } => {
+    const row = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as Row | undefined;
+    if (!row) throw new Error("USER_NOT_FOUND");
+    const timestamp = nowIso();
+    db.prepare("UPDATE sync_metadata SET active_user_id = ?, updated_at = ? WHERE id = 'default'").run(userId, timestamp);
+    ensureUserState(userId);
+    return { user: mapUserProfile(row), syncStatus: getSyncStatus() };
+  };
+
+  const buildSnapshot = (exportedAt = nowIso()): SyncSnapshot => {
+    const syncStatus = getSyncStatus();
+    return {
+      version: syncSchemaVersion,
+      exportedAt,
+      deviceId: syncStatus.deviceId,
+      activeProfileId: syncStatus.activeProfileId,
+      users: listUsers(),
+      books: listBooks("all", syncStatus.activeProfileId),
+      readingStates: db
+        .prepare("SELECT * FROM reading_states ORDER BY user_id, book_id")
+        .all()
+        .map((row) => mapReadingState(row as Row)),
+      uiStates: db
+        .prepare("SELECT * FROM ui_state ORDER BY user_id")
+        .all()
+        .map((row) => mapUiState(row as Row)),
+      generationRuns: db
+        .prepare("SELECT * FROM generation_runs ORDER BY created_at, rowid")
+        .all()
+        .map((row) => {
+          const runId = asString((row as Row).id);
+          return mapGenerationRun(row as Row, listGenerationChapterRuns(runId), listGenerationArtifacts(runId));
+        }),
+      tutorThreads: db
+        .prepare("SELECT * FROM tutor_threads ORDER BY user_id, updated_at")
+        .all()
+        .map((row) => mapTutorThread(row as Row, listTutorMessages(asString((row as Row).id))))
+    };
+  };
+
+  const exportSnapshot = (): SyncSnapshot => {
+    const exportedAt = nowIso();
+    db.prepare("UPDATE sync_metadata SET last_export_at = ?, updated_at = ? WHERE id = 'default'").run(exportedAt, exportedAt);
+    return buildSnapshot(exportedAt);
+  };
+
+  const importSnapshot = (payload: ImportSyncSnapshotPayload): SyncSnapshot => {
+    const importRows = db.transaction(() => {
+      if (payload.mode === "replace") {
+        db.prepare("DELETE FROM tutor_messages").run();
+        db.prepare("DELETE FROM tutor_threads").run();
+        db.prepare("DELETE FROM generation_artifacts").run();
+        db.prepare("DELETE FROM generation_chapter_runs").run();
+        db.prepare("DELETE FROM generation_runs").run();
+        db.prepare("DELETE FROM reading_states").run();
+        db.prepare("DELETE FROM ui_state").run();
+        db.prepare("DELETE FROM books").run();
+        db.prepare("DELETE FROM users WHERE id <> ?").run(defaultUserId);
+      }
+
+      for (const user of payload.snapshot.users) upsertUser(db, user);
+      ensureUser(defaultUserId);
+      for (const book of payload.snapshot.books) saveBook(book);
+      for (const state of payload.snapshot.readingStates) upsertReadingState(state);
+      for (const uiState of payload.snapshot.uiStates) upsertUiState(uiState);
+      for (const run of payload.snapshot.generationRuns) upsertGenerationRun(run, {});
+      for (const thread of payload.snapshot.tutorThreads) upsertTutorThread(thread);
+      const activeUserId = payload.snapshot.users.some((user) => user.id === payload.snapshot.activeProfileId) ? payload.snapshot.activeProfileId : defaultUserId;
+      const timestamp = nowIso();
+      db.prepare("UPDATE sync_metadata SET active_user_id = ?, last_import_at = ?, updated_at = ? WHERE id = 'default'").run(activeUserId, timestamp, timestamp);
+    });
+    importRows();
+    return buildSnapshot();
+  };
+
   const seedIfEmpty = () => {
     const count = db.prepare("SELECT COUNT(*) AS count FROM books").get() as { count: number };
     if (count.count > 0) return;
 
     const seed = db.transaction(() => {
+      upsertUser(db, defaultUserProfile());
       for (const book of seedBooks) saveBook(book);
       const activeBook = seedBooks[0];
       const activeChapter = activeBook.chapters.find((chapter) => chapter.id === activeBook.currentChapterId) ?? activeBook.chapters[0];
       if (!activeChapter) return;
 
       db.prepare(
-        `INSERT INTO reading_states (book_id, chapter_id, progress_percent, scroll_y, updated_at)
-         VALUES (?, ?, ?, ?, ?)`
-      ).run(activeBook.id, activeChapter.id, activeChapter.progress, 0, seedUiState.updatedAt);
+        `INSERT INTO reading_states (user_id, book_id, chapter_id, progress_percent, scroll_y, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(defaultUserId, activeBook.id, activeChapter.id, activeChapter.progress, 0, seedUiState.updatedAt);
 
       db.prepare(
         `INSERT INTO ui_state (
-          id, active_book_id, active_chapter_id, view, focus, mobile_panel, preferences_json, updated_at
+          user_id, id, active_book_id, active_chapter_id, view, focus, mobile_panel, preferences_json, updated_at
         ) VALUES (
-          @id, @activeBookId, @activeChapterId, @view, @focus, @mobilePanel, @preferencesJson, @updatedAt
+          @userId, @id, @activeBookId, @activeChapterId, @view, @focus, @mobilePanel, @preferencesJson, @updatedAt
         )`
       ).run({
         ...seedUiState,
@@ -407,9 +1048,9 @@ export const createRepository = (db: SqliteDatabase) => {
       const threadId = "thread-repo-books-chapter-1-2";
       const timestamp = seedUiState.updatedAt;
       db.prepare(
-        `INSERT INTO tutor_threads (id, book_id, chapter_id, title, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      ).run(threadId, activeBook.id, activeChapter.id, "폴더를 대단원으로 바꾸기", timestamp, timestamp);
+        `INSERT INTO tutor_threads (id, user_id, book_id, chapter_id, title, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(threadId, defaultUserId, activeBook.id, activeChapter.id, "폴더를 대단원으로 바꾸기", timestamp, timestamp);
       insertTutorMessage(db, {
         id: "message-repo-books-welcome",
         threadId,
@@ -425,6 +1066,12 @@ export const createRepository = (db: SqliteDatabase) => {
   return {
     db,
     seedIfEmpty,
+    listUsers,
+    ensureUser,
+    createUser,
+    updateUser,
+    activateUser,
+    getSyncStatus,
     listBooks,
     getBook,
     getReadingState,
@@ -432,27 +1079,131 @@ export const createRepository = (db: SqliteDatabase) => {
     getUiState,
     saveUiState,
     createGenerationRun,
+    getGenerationRun,
+    retryFailedGenerationChapters,
+    retryGenerationChapter,
     listTutorThreads,
-    appendTutorMessage
+    appendTutorMessage,
+    exportSnapshot,
+    importSnapshot
   };
 
-  function createDefaultTutorThread(bookId: string, chapterId: string): TutorThread {
-    const book = getBook(bookId);
+  function applyUserReadingState(book: RepoBook, userId: string): RepoBook {
+    const state = db.prepare("SELECT * FROM reading_states WHERE user_id = ? AND book_id = ?").get(userId, book.id) as Row | undefined;
+    if (!state) return book;
+    return {
+      ...book,
+      currentChapterId: asString(state.chapter_id),
+      progress: asNumber(state.progress_percent)
+    };
+  }
+
+  function ensureUserState(userId: string) {
+    ensureUser(userId);
+    const existing = db.prepare("SELECT user_id FROM ui_state WHERE user_id = ?").get(userId) as Row | undefined;
+    if (existing) return;
+
+    const activeBook = seedBooks.find((book) => getBaseBook(book.id)) ?? listBooks("all", defaultUserId)[0];
+    if (!activeBook) return;
+    const activeChapter = activeBook.chapters.find((chapter) => chapter.id === activeBook.currentChapterId) ?? activeBook.chapters[0];
+    if (!activeChapter) return;
+
+    upsertUiState({
+      ...seedUiState,
+      userId,
+      activeBookId: activeBook.id,
+      activeChapterId: activeChapter.id,
+      updatedAt: nowIso()
+    });
+  }
+
+  function upsertReadingState(state: ReadingState) {
+    ensureUser(state.userId);
+    db.prepare(
+      `INSERT INTO reading_states (user_id, book_id, chapter_id, progress_percent, scroll_y, updated_at)
+       VALUES (@userId, @bookId, @chapterId, @progressPercent, @scrollY, @updatedAt)
+       ON CONFLICT(user_id, book_id) DO UPDATE SET
+         chapter_id = excluded.chapter_id,
+         progress_percent = excluded.progress_percent,
+         scroll_y = excluded.scroll_y,
+         updated_at = excluded.updated_at`
+    ).run(state);
+  }
+
+  function upsertUiState(state: UIState) {
+    ensureUser(state.userId);
+    db.prepare(
+      `INSERT INTO ui_state (
+        user_id, id, active_book_id, active_chapter_id, view, focus, mobile_panel, preferences_json, updated_at
+      ) VALUES (
+        @userId, @id, @activeBookId, @activeChapterId, @view, @focus, @mobilePanel, @preferencesJson, @updatedAt
+      )
+      ON CONFLICT(user_id) DO UPDATE SET
+        active_book_id = excluded.active_book_id,
+        active_chapter_id = excluded.active_chapter_id,
+        view = excluded.view,
+        focus = excluded.focus,
+        mobile_panel = excluded.mobile_panel,
+        preferences_json = excluded.preferences_json,
+        updated_at = excluded.updated_at`
+    ).run({
+      ...state,
+      focus: state.focus ? 1 : 0,
+      preferencesJson: json(state.preferences)
+    });
+  }
+
+  function upsertGenerationRun(run: GenerationRun, payload: Record<string, unknown>) {
+    insertGenerationRun.run({
+      ...run,
+      stepsJson: json(run.steps),
+      outlineJson: json(run.outline),
+      payloadJson: json(payload)
+    });
+    db.prepare("DELETE FROM generation_chapter_runs WHERE run_id = ?").run(run.id);
+    for (const chapterRun of run.chapterRuns) insertGenerationChapterRun.run(chapterRun);
+    db.prepare("DELETE FROM generation_artifacts WHERE run_id = ?").run(run.id);
+    for (const artifact of run.artifacts ?? []) {
+      insertGenerationArtifact.run({ ...artifact, payloadJson: json(artifact.payload) });
+    }
+  }
+
+  function upsertTutorThread(thread: TutorThread) {
+    ensureUser(thread.userId);
+    db.prepare(
+      `INSERT INTO tutor_threads (id, user_id, book_id, chapter_id, title, created_at, updated_at)
+       VALUES (@id, @userId, @bookId, @chapterId, @title, @createdAt, @updatedAt)
+       ON CONFLICT(id) DO UPDATE SET
+         user_id = excluded.user_id,
+         book_id = excluded.book_id,
+         chapter_id = excluded.chapter_id,
+         title = excluded.title,
+         updated_at = excluded.updated_at`
+    ).run(thread);
+    db.prepare("DELETE FROM tutor_messages WHERE thread_id = ?").run(thread.id);
+    for (const message of thread.messages) insertTutorMessage(db, message);
+  }
+
+  function createDefaultTutorThread(bookId: string, chapterId: string, userId: string): TutorThread {
+    const book = getBook(bookId, userId);
     if (!book) throw new Error("BOOK_NOT_FOUND");
     const chapter = book.chapters.find((item) => item.id === chapterId);
     if (!chapter) throw new Error("CHAPTER_NOT_FOUND");
 
     const timestamp = nowIso();
-    const threadId = `thread-${bookId}-${chapterId}`;
+    const safeUserId = userId.replace(/[^A-Za-z0-9_-]/g, "_");
+    const threadId = userId === defaultUserId ? `thread-${bookId}-${chapterId}` : `thread-${safeUserId}-${bookId}-${chapterId}`;
     db.prepare(
-      `INSERT INTO tutor_threads (id, book_id, chapter_id, title, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(threadId, bookId, chapterId, chapter.title, timestamp, timestamp);
+      `INSERT INTO tutor_threads (id, user_id, book_id, chapter_id, title, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(threadId, userId, bookId, chapterId, chapter.title, timestamp, timestamp);
     insertTutorMessage(db, {
       id: randomUUID(),
       threadId,
       role: "assistant",
-      body: "이 챕터를 읽을 때는 먼저 목표와 관련 파일을 확인한 뒤, 본문에서 제시하는 코드 근거를 따라가면 됩니다.",
+      body: chapter.keyQuestion
+        ? `이 챕터의 핵심 질문은 "${chapter.keyQuestion}"입니다. 본문, 코드 앵커, 근거 파일을 기준으로 저장소의 책임과 변경 지점을 함께 설명합니다.`
+        : "이 챕터는 본문 설명과 코드 근거를 함께 사용해 저장소의 책임, 흐름, 변경 지점을 설명합니다.",
       metadata: { default: true },
       createdAt: timestamp
     });
@@ -461,18 +1212,20 @@ export const createRepository = (db: SqliteDatabase) => {
   }
 
   function buildTutorReply(thread: Row, question: string) {
-    const book = getBook(asString(thread.book_id));
+    const book = getBook(asString(thread.book_id), asString(thread.user_id));
     const chapter = book?.chapters.find((item) => item.id === asString(thread.chapter_id));
-    if (!book || !chapter) return "이 장에서는 먼저 관련 파일을 2-3개로 좁히고, 목표와 체크포인트를 기준으로 읽는 것이 좋습니다.";
+    if (!book || !chapter) return "현재 챕터의 본문과 코드 근거를 기준으로 저장소 책임, 흐름, 변경 지점을 함께 좁혀 보겠습니다.";
 
     const files = chapter.files.slice(0, 3).join(", ");
     const checkpoint = chapter.checkpoints[0] ?? "핵심 API 경계를 표시";
     const firstGoal = chapter.goals[0] ?? "이 장의 책임을 요약";
     const trimmedQuestion = question.trim().slice(0, 120);
+    const anchor = chapter.codeAnchors?.[0];
     return [
-      `질문을 ${chapter.title} 맥락으로 보면, 먼저 ${files || "챕터의 근거 파일"}을 열고 ${firstGoal}하는 흐름이 좋습니다.`,
-      `특히 ${checkpoint}를 확인하면 다음 장으로 넘어갈 기준이 생깁니다.`,
-      trimmedQuestion ? `질문 "${trimmedQuestion}"에 대한 답은 본문 전체보다 이 체크포인트를 통과했는지로 좁혀서 판단하세요.` : ""
+      `질문을 ${chapter.title} 맥락으로 보면, ${chapter.keyQuestion ?? firstGoal}가 핵심입니다.`,
+      `${files || "챕터의 근거 파일"}와 ${anchor ? `${anchor.filePath}${anchor.symbolName ? `의 ${anchor.symbolName}` : ""}` : "코드 근거"}가 이 답변의 근거입니다.`,
+      `특히 ${checkpoint}를 만족하는지 확인하면 변경 판단의 기준이 생깁니다.`,
+      trimmedQuestion ? `질문 "${trimmedQuestion}"은 이 책임과 근거의 연결로 좁혀서 답할 수 있습니다.` : ""
     ]
       .filter(Boolean)
       .join(" ");
@@ -494,24 +1247,44 @@ const mapPart = (row: Row): BookPart => ({
   summary: asString(row.summary)
 });
 
-const mapChapter = (row: Row): BookChapter => ({
-  id: asString(row.id),
-  bookId: asString(row.book_id),
-  partId: asString(row.part_id),
-  order: asNumber(row.sort_order),
-  number: asString(row.number),
-  title: asString(row.title),
-  subtitle: asString(row.subtitle),
-  progress: asNumber(row.progress),
-  status: asString(row.status) as BookChapter["status"],
-  estimatedMinutes: asNumber(row.estimated_minutes),
-  files: parseJson<string[]>(row.files_json, []),
-  goals: parseJson<string[]>(row.goals_json, []),
-  sections: parseJson<BookChapter["sections"]>(row.sections_json, []),
-  code: parseJson<BookChapter["code"]>(row.code_json, null),
-  notes: parseJson<BookChapter["notes"]>(row.notes_json, []),
-  checkpoints: parseJson<string[]>(row.checkpoints_json, [])
+const chapterBodyJson = (chapter: BookChapter) => ({
+  keyQuestion: chapter.keyQuestion,
+  responsibility: chapter.responsibility,
+  flow: chapter.flow,
+  codeAnchors: chapter.codeAnchors,
+  evidence: chapter.evidence,
+  glossary: chapter.glossary,
+  recap: chapter.recap
 });
+
+const mapChapter = (row: Row): BookChapter => {
+  const body = parseJson<Partial<BookChapter>>(row.chapter_body_json, {});
+  return {
+    id: asString(row.id),
+    bookId: asString(row.book_id),
+    partId: asString(row.part_id),
+    order: asNumber(row.sort_order),
+    number: asString(row.number),
+    title: asString(row.title),
+    subtitle: asString(row.subtitle),
+    progress: asNumber(row.progress),
+    status: asString(row.status) as BookChapter["status"],
+    estimatedMinutes: asNumber(row.estimated_minutes),
+    files: parseJson<string[]>(row.files_json, []),
+    goals: parseJson<string[]>(row.goals_json, []),
+    sections: parseJson<BookChapter["sections"]>(row.sections_json, []),
+    code: parseJson<BookChapter["code"]>(row.code_json, null),
+    notes: parseJson<BookChapter["notes"]>(row.notes_json, []),
+    checkpoints: parseJson<string[]>(row.checkpoints_json, []),
+    keyQuestion: body.keyQuestion,
+    responsibility: body.responsibility,
+    flow: body.flow,
+    codeAnchors: body.codeAnchors,
+    evidence: body.evidence,
+    glossary: body.glossary,
+    recap: body.recap
+  };
+};
 
 const mapBook = (row: Row, parts: BookPart[], chapters: BookChapter[]): RepoBook => ({
   id: asString(row.id),
@@ -531,6 +1304,7 @@ const mapBook = (row: Row, parts: BookPart[], chapters: BookChapter[]): RepoBook
 });
 
 const mapReadingState = (row: Row): ReadingState => ({
+  userId: asString(row.user_id) || defaultUserId,
   bookId: asString(row.book_id),
   chapterId: asString(row.chapter_id),
   progressPercent: asNumber(row.progress_percent),
@@ -540,6 +1314,7 @@ const mapReadingState = (row: Row): ReadingState => ({
 
 const mapUiState = (row: Row): UIState => ({
   id: "default",
+  userId: asString(row.user_id) || defaultUserId,
   activeBookId: asString(row.active_book_id),
   activeChapterId: row.active_chapter_id === null ? null : asString(row.active_chapter_id),
   view: asString(row.view) as UIState["view"],
@@ -549,8 +1324,51 @@ const mapUiState = (row: Row): UIState => ({
   updatedAt: asString(row.updated_at)
 });
 
+const mapGenerationRun = (row: Row, chapterRuns: GenerationChapterRun[], artifacts: GenerationArtifact[] = []): GenerationRun => ({
+  id: asString(row.id),
+  userId: asString(row.user_id) || defaultUserId,
+  bookId: row.book_id === null ? null : asString(row.book_id),
+  repoUrl: asString(row.repo_url),
+  branch: asString(row.branch),
+  model: asString(row.model),
+  context: asString(row.context),
+  status: asString(row.status) as GenerationRun["status"],
+  progress: asNumber(row.progress),
+  steps: parseJson<GenerationRun["steps"]>(row.steps_json, []),
+  outline: parseJson<GenerationRun["outline"]>(row.outline_json, []),
+  chapterRuns,
+  artifacts,
+  error: asString(row.error),
+  createdAt: asString(row.created_at),
+  updatedAt: asString(row.updated_at)
+});
+
+const mapGenerationChapterRun = (row: Row): GenerationChapterRun => ({
+  id: asString(row.id),
+  runId: asString(row.run_id),
+  chapterId: asString(row.chapter_id),
+  order: asNumber(row.sort_order),
+  title: asString(row.title),
+  status: asString(row.status) as GenerationChapterRun["status"],
+  attempts: asNumber(row.attempts),
+  source: asString(row.source),
+  lastError: row.last_error === null ? null : asString(row.last_error),
+  updatedAt: asString(row.updated_at)
+});
+
+const mapGenerationArtifact = (row: Row): GenerationArtifact => ({
+  id: asString(row.id),
+  runId: asString(row.run_id),
+  chapterId: row.chapter_id === null ? null : asString(row.chapter_id),
+  kind: asString(row.kind),
+  order: asNumber(row.sort_order),
+  payload: parseJson<Record<string, unknown>>(row.payload_json, {}),
+  createdAt: asString(row.created_at)
+});
+
 const mapTutorThread = (row: Row, messages: TutorMessage[]): TutorThread => ({
   id: asString(row.id),
+  userId: asString(row.user_id) || defaultUserId,
   bookId: asString(row.book_id),
   chapterId: asString(row.chapter_id),
   title: asString(row.title),
@@ -567,3 +1385,108 @@ const mapTutorMessage = (row: Row): TutorMessage => ({
   metadata: parseJson<Record<string, unknown>>(row.metadata_json, {}),
   createdAt: asString(row.created_at)
 });
+
+const mapUserProfile = (row: Row): UserProfile => ({
+  id: asString(row.id),
+  name: asString(row.name),
+  color: asString(row.color),
+  createdAt: asString(row.created_at),
+  updatedAt: asString(row.updated_at)
+});
+
+const mapSyncStatus = (row: Row): SyncStatus => ({
+  deviceId: asString(row.device_id),
+  schemaVersion: asNumber(row.schema_version),
+  activeProfileId: asString(row.active_user_id) || defaultUserId,
+  lastExportAt: row.last_export_at === null ? null : asString(row.last_export_at),
+  lastImportAt: row.last_import_at === null ? null : asString(row.last_import_at),
+  updatedAt: asString(row.updated_at)
+});
+
+const repairBookChapters = (book: RepoBook, chapterIds: Set<string>): RepoBook => ({
+  ...book,
+  chapters: book.chapters.map((chapter) =>
+    chapterIds.has(chapter.id)
+      ? {
+          ...chapter,
+          status: chapter.id === book.currentChapterId ? "current" : "draft",
+          estimatedMinutes: Math.max(chapter.estimatedMinutes, 28),
+          sections: repairChapterSections(chapter)
+        }
+      : chapter
+  )
+});
+
+const repairChapterSections = (chapter: BookChapter): BookChapter["sections"] => {
+  const evidencePaths = Array.from(
+    new Set([...(chapter.evidence ?? []).map((item) => item.filePath), ...(chapter.codeAnchors ?? []).map((anchor) => anchor.filePath), ...chapter.files].filter(Boolean))
+  );
+  const primaryFiles = evidencePaths.length ? evidencePaths : ["README.md"];
+  const anchors = chapter.codeAnchors?.length
+    ? chapter.codeAnchors
+    : primaryFiles.map((filePath) => ({
+        filePath,
+        symbolName: "",
+        lineHint: "",
+        claim: `${chapter.title}의 책임 근거`,
+        explanation: "저장된 챕터 근거에서 복구한 코드 앵커",
+        excerptLines: []
+      }));
+  const recap = chapter.recap ?? {
+    understood: chapter.goals,
+    changeEntryPoints: primaryFiles.slice(0, 3),
+    nextQuestions: chapter.checkpoints
+  };
+  const specs = [
+    ["핵심 질문", chapter.keyQuestion || `${chapter.title}는 저장소에서 어떤 책임을 맡는가`, "챕터의 질문을 저장소 책임으로 고정한다."],
+    ["책임 경계", `${chapter.title}의 시스템 책임`, chapter.responsibility || chapter.subtitle],
+    ["흐름", chapter.flow?.title || `${chapter.title}의 실행 흐름`, chapter.flow?.summary || "관련 모듈과 설정이 어떤 순서로 맞물리는지 설명한다."],
+    ["핵심 구현", "코드 앵커가 증명하는 구현 계약", "파일 근거와 공개 symbol을 통해 본문 단정을 검증한다."],
+    ["변경 판단", `${chapter.title}를 변경할 때의 영향 범위`, "수정 전에 확인할 진입점, 설정, 테스트를 연결한다."],
+    ["Recap", "다음 장으로 넘겨야 할 질문", "이 장에서 이해한 내용과 다음 판단 기준을 정리한다."]
+  ];
+
+  return specs.map(([eyebrow, title, purpose], index) => {
+    const anchor = anchors[index % anchors.length];
+    const start = index % Math.max(1, primaryFiles.length);
+    const files = primaryFiles.slice(start, start + 3);
+    const visibleFiles = files.length ? files : primaryFiles.slice(0, 3);
+    const nextQuestion = recap.nextQuestions[index % Math.max(1, recap.nextQuestions.length)] ?? chapter.checkpoints[index % Math.max(1, chapter.checkpoints.length)] ?? chapter.goals[0] ?? chapter.title;
+    const changeEntry = recap.changeEntryPoints[index % Math.max(1, recap.changeEntryPoints.length)] ?? visibleFiles[0];
+    return {
+      eyebrow,
+      title,
+      body: [
+        `${purpose} ${chapter.keyQuestion || chapter.subtitle}라는 질문은 ${chapter.title}를 파일 묶음이 아니라 ${chapter.responsibility || chapter.subtitle}라는 저장소 책임으로 이해하게 만든다. ${visibleFiles.join(", ")}는 이 책임이 실제 코드와 문서에 걸쳐 분산되어 있음을 보여 주는 근거다.`,
+        `${anchor.filePath}${anchor.symbolName ? `의 ${anchor.symbolName}` : ""}는 ${anchor.claim}을 보여 준다. 이 근거는 ${anchor.explanation} 때문에 중요하며, 독자는 이 절만으로도 어떤 파일이 공개 계약을 만들고 어떤 파일이 변경 위험을 받는지 설명할 수 있다.`,
+        `변경 시에는 ${changeEntry}를 먼저 확인하고, ${nextQuestion}라는 질문으로 영향 범위를 다시 점검한다. 이 절의 결론은 ${recap.understood.slice(0, 2).join(", ") || chapter.goals.join(", ")}이며, 다음 절에서는 같은 근거를 더 구체적인 실행 흐름이나 검증 기준으로 좁힌다.`
+      ].join("\n\n")
+    };
+  });
+};
+
+const generationStageDefaults = [
+  ["저장소 분석", "waiting for repository scan and index"],
+  ["대단원 설계", "waiting for part plan"],
+  ["소단원 설계", "waiting for chapter plan"],
+  ["근거 수집", "waiting for chapter briefs and code anchors"],
+  ["본문 생성", "waiting for section drafts"],
+  ["챕터 수리", "waiting for revision pass"],
+  ["책 일관성 점검", "waiting for coherence pass"]
+] as const;
+
+const pendingGenerationSteps = (): GenerationRun["steps"] =>
+  generationStageDefaults.map(([label, detail]) => ({ label, state: "pending", detail }));
+
+const runningGenerationSteps = (): GenerationRun["steps"] => stagedGenerationSteps("저장소 분석", "materializing repository");
+
+const stagedGenerationSteps = (activeLabel: string, activeDetail: string): GenerationRun["steps"] => {
+  const activeIndex = Math.max(0, generationStageDefaults.findIndex(([label]) => label === activeLabel));
+  return generationStageDefaults.map(([label, detail], index) => ({
+    label,
+    state: index < activeIndex ? "complete" : index === activeIndex ? "active" : "pending",
+    detail: index === activeIndex ? activeDetail : index < activeIndex ? "complete" : detail
+  }));
+};
+
+const errorMessage = (error: unknown) => (error instanceof Error ? error.message : "UNKNOWN_ERROR");

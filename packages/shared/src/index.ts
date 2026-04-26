@@ -2,11 +2,20 @@ import { z } from "zod";
 
 export const bookStatusSchema = z.enum(["reading", "complete", "generating", "draft"]);
 export const bookFilterSchema = z.enum(["all", "in_progress", "generating", "draft"]);
-export const chapterStatusSchema = z.enum(["complete", "current", "next", "locked", "draft", "generating"]);
+export const chapterStatusSchema = z.enum(["complete", "current", "next", "locked", "draft", "generating", "failed"]);
 export const generationStatusSchema = z.enum(["queued", "running", "complete", "failed"]);
 export const generationStepStateSchema = z.enum(["pending", "active", "complete", "failed"]);
+export const generationChapterRunStatusSchema = z.enum(["queued", "running", "complete", "failed"]);
 export const tutorMessageRoleSchema = z.enum(["user", "assistant", "system"]);
 export const readerViewSchema = z.enum(["library", "reader", "generation"]);
+
+export const userProfileSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  color: z.string().default("cyan"),
+  createdAt: z.string(),
+  updatedAt: z.string()
+});
 
 export const textSectionSchema = z.object({
   eyebrow: z.string(),
@@ -23,6 +32,42 @@ export const codeExcerptSchema = z.object({
 export const chapterNoteSchema = z.object({
   title: z.string(),
   body: z.string()
+});
+
+export const chapterFlowSchema = z.object({
+  type: z.enum(["architecture", "execution", "data", "configuration", "testing", "concept"]).default("concept"),
+  title: z.string(),
+  summary: z.string(),
+  diagram: z.string().default("")
+});
+
+export const codeAnchorSchema = z.object({
+  filePath: z.string(),
+  symbolName: z.string().default(""),
+  lineHint: z.string().default(""),
+  claim: z.string(),
+  explanation: z.string(),
+  excerptLines: z.array(z.string()).default([])
+});
+
+export const chapterEvidenceSchema = z.object({
+  filePath: z.string(),
+  role: z.string(),
+  usedAsEvidence: z.string(),
+  outOfScope: z.string().default("")
+});
+
+export const chapterGlossaryEntrySchema = z.object({
+  term: z.string(),
+  meaning: z.string(),
+  appearsIn: z.string().default(""),
+  relatedAnchors: z.array(z.string()).default([])
+});
+
+export const chapterRecapSchema = z.object({
+  understood: z.array(z.string()).default([]),
+  changeEntryPoints: z.array(z.string()).default([]),
+  nextQuestions: z.array(z.string()).default([])
 });
 
 export const bookPartSchema = z.object({
@@ -49,7 +94,14 @@ export const bookChapterSchema = z.object({
   sections: z.array(textSectionSchema),
   code: codeExcerptSchema.nullable(),
   notes: z.array(chapterNoteSchema),
-  checkpoints: z.array(z.string())
+  checkpoints: z.array(z.string()),
+  keyQuestion: z.string().optional(),
+  responsibility: z.string().optional(),
+  flow: chapterFlowSchema.nullable().optional(),
+  codeAnchors: z.array(codeAnchorSchema).optional(),
+  evidence: z.array(chapterEvidenceSchema).optional(),
+  glossary: z.array(chapterGlossaryEntrySchema).optional(),
+  recap: chapterRecapSchema.optional()
 });
 
 export const repoBookSchema = z.object({
@@ -81,8 +133,32 @@ export const generationOutlinePartSchema = z.object({
   chapters: z.array(z.string())
 });
 
+export const generationChapterRunSchema = z.object({
+  id: z.string(),
+  runId: z.string(),
+  chapterId: z.string(),
+  order: z.number().int().nonnegative(),
+  title: z.string(),
+  status: generationChapterRunStatusSchema,
+  attempts: z.number().int().nonnegative(),
+  source: z.string(),
+  lastError: z.string().nullable(),
+  updatedAt: z.string()
+});
+
+export const generationArtifactSchema = z.object({
+  id: z.string(),
+  runId: z.string(),
+  chapterId: z.string().nullable(),
+  kind: z.string(),
+  order: z.number().int().nonnegative(),
+  payload: z.record(z.unknown()),
+  createdAt: z.string()
+});
+
 export const generationRunSchema = z.object({
   id: z.string(),
+  userId: z.string().default("local"),
   bookId: z.string().nullable(),
   repoUrl: z.string(),
   branch: z.string(),
@@ -92,11 +168,39 @@ export const generationRunSchema = z.object({
   progress: z.number().min(0).max(100),
   steps: z.array(generationStepSchema),
   outline: z.array(generationOutlinePartSchema),
+  chapterRuns: z.array(generationChapterRunSchema).default([]),
+  artifacts: z.array(generationArtifactSchema).default([]),
+  error: z.string().default(""),
   createdAt: z.string(),
   updatedAt: z.string()
 });
 
+export const createProfileSchema = z.object({
+  id: z.string().min(1).optional(),
+  displayName: z.string().min(1).max(80).optional(),
+  name: z.string().min(1).max(80).optional(),
+  color: z.string().default("cyan")
+}).refine((payload) => payload.displayName || payload.name, {
+  message: "displayName or name is required"
+});
+
+export const patchUserProfileSchema = z.object({
+  displayName: z.string().min(1).max(80).optional(),
+  name: z.string().min(1).max(80).optional(),
+  color: z.string().min(1).optional()
+});
+
+export const syncStatusSchema = z.object({
+  deviceId: z.string(),
+  schemaVersion: z.number().int().positive(),
+  activeProfileId: z.string(),
+  lastExportAt: z.string().nullable(),
+  lastImportAt: z.string().nullable(),
+  updatedAt: z.string()
+});
+
 export const readingStateSchema = z.object({
+  userId: z.string().default("local"),
   bookId: z.string(),
   chapterId: z.string(),
   progressPercent: z.number().min(0).max(100),
@@ -115,6 +219,7 @@ export const tutorMessageSchema = z.object({
 
 export const tutorThreadSchema = z.object({
   id: z.string(),
+  userId: z.string().default("local"),
   bookId: z.string(),
   chapterId: z.string(),
   title: z.string(),
@@ -125,6 +230,7 @@ export const tutorThreadSchema = z.object({
 
 export const uiStateSchema = z.object({
   id: z.literal("default"),
+  userId: z.string().default("local"),
   activeBookId: z.string(),
   activeChapterId: z.string().nullable(),
   view: readerViewSchema,
@@ -153,13 +259,16 @@ export const patchUiStateSchema = z.object({
   preferences: z.record(z.unknown()).optional()
 });
 
+export const postUserProfileSchema = createProfileSchema;
+
 export const postGenerationOutlineSchema = z.object({
   repoUrl: z.string().min(1),
   branch: z.string().default("main"),
   model: z.string().default("qwen3-coder 14B"),
   context: z.string().default("128k"),
   audience: z.string().default("유지보수 가능한 junior developer"),
-  depth: z.string().default("balanced")
+  depth: z.string().default("balanced"),
+  background: z.boolean().default(false)
 });
 
 export const tutorThreadsQuerySchema = z.object({
@@ -173,22 +282,54 @@ export const postTutorMessageSchema = z.object({
   metadata: z.record(z.unknown()).default({})
 });
 
+export const syncSnapshotSchema = z.object({
+  version: z.literal(1),
+  exportedAt: z.string(),
+  deviceId: z.string(),
+  activeProfileId: z.string(),
+  users: z.array(userProfileSchema),
+  books: z.array(repoBookSchema.extend({ userId: z.string().optional() })),
+  readingStates: z.array(readingStateSchema),
+  uiStates: z.array(uiStateSchema),
+  generationRuns: z.array(generationRunSchema),
+  tutorThreads: z.array(tutorThreadSchema)
+});
+
+export const syncImportSchema = z.object({
+  mode: z.enum(["merge", "replace"]).default("merge"),
+  snapshot: syncSnapshotSchema
+});
+
+export const importSyncSnapshotSchema = syncImportSchema;
+
 export type BookStatus = z.infer<typeof bookStatusSchema>;
 export type BookFilter = z.infer<typeof bookFilterSchema>;
 export type ChapterStatus = z.infer<typeof chapterStatusSchema>;
 export type GenerationStatus = z.infer<typeof generationStatusSchema>;
 export type GenerationStepState = z.infer<typeof generationStepStateSchema>;
+export type GenerationChapterRunStatus = z.infer<typeof generationChapterRunStatusSchema>;
 export type TutorMessageRole = z.infer<typeof tutorMessageRoleSchema>;
 export type ReaderView = z.infer<typeof readerViewSchema>;
 export type TextSection = z.infer<typeof textSectionSchema>;
 export type CodeExcerpt = z.infer<typeof codeExcerptSchema>;
 export type ChapterNote = z.infer<typeof chapterNoteSchema>;
+export type ChapterFlow = z.infer<typeof chapterFlowSchema>;
+export type CodeAnchor = z.infer<typeof codeAnchorSchema>;
+export type ChapterEvidence = z.infer<typeof chapterEvidenceSchema>;
+export type ChapterGlossaryEntry = z.infer<typeof chapterGlossaryEntrySchema>;
+export type ChapterRecap = z.infer<typeof chapterRecapSchema>;
 export type BookPart = z.infer<typeof bookPartSchema>;
 export type BookChapter = z.infer<typeof bookChapterSchema>;
 export type RepoBook = z.infer<typeof repoBookSchema>;
 export type GenerationStep = z.infer<typeof generationStepSchema>;
 export type GenerationOutlinePart = z.infer<typeof generationOutlinePartSchema>;
+export type GenerationChapterRun = z.infer<typeof generationChapterRunSchema>;
+export type GenerationArtifact = z.infer<typeof generationArtifactSchema>;
 export type GenerationRun = z.infer<typeof generationRunSchema>;
+export type UserProfile = z.infer<typeof userProfileSchema>;
+export type CreateProfilePayload = z.infer<typeof createProfileSchema>;
+export type SyncStatus = z.infer<typeof syncStatusSchema>;
+export type SyncSnapshot = z.infer<typeof syncSnapshotSchema>;
 export type ReadingState = z.infer<typeof readingStateSchema>;
 export type TutorThread = z.infer<typeof tutorThreadSchema>;
 export type TutorMessage = z.infer<typeof tutorMessageSchema>;
@@ -199,6 +340,10 @@ export type PatchUIStatePayload = z.infer<typeof patchUiStateSchema>;
 export type PostGenerationOutlinePayload = z.infer<typeof postGenerationOutlineSchema>;
 export type TutorThreadsQuery = z.infer<typeof tutorThreadsQuerySchema>;
 export type PostTutorMessagePayload = z.infer<typeof postTutorMessageSchema>;
+export type SyncImportPayload = z.infer<typeof syncImportSchema>;
+export type PostUserProfilePayload = z.infer<typeof postUserProfileSchema>;
+export type PatchUserProfilePayload = z.infer<typeof patchUserProfileSchema>;
+export type ImportSyncSnapshotPayload = z.infer<typeof importSyncSnapshotSchema>;
 
 const baseParts: BookPart[] = [
   {
@@ -411,6 +556,7 @@ export const seedGenerationOutline: GenerationOutlinePart[] = [
 
 export const seedUiState: UIState = uiStateSchema.parse({
   id: "default",
+  userId: "local",
   activeBookId: "repo-books-book",
   activeChapterId: seedBooks[0]?.currentChapterId ?? null,
   view: "library",

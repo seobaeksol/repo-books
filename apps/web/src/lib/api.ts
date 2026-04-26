@@ -20,11 +20,12 @@ export type GenerationInput = {
   model: string;
   audience: string;
   depth: string;
+  background?: boolean;
 };
 
 export type GenerationResult = {
   run: GenerationRun;
-  book: BookWithContent;
+  book: BookWithContent | null;
 };
 
 export type TutorThreadWithMessages = TutorThread & {
@@ -55,15 +56,26 @@ const unwrap = <T>(value: unknown, key: string): T => {
   return value as T;
 };
 
+const getBookById = async (bookId: string) => {
+  const payload = await request(`/api/books/${bookId}`);
+  const book = unwrap<BookWithContent>(payload, "book");
+  const readingState = payload && typeof payload === "object" ? (payload as { readingState?: ReadingState }).readingState : undefined;
+  return { ...book, readingState };
+};
+
+const normalizeGenerationResult = async (response: { generationRun?: GenerationRun; run?: GenerationRun; book?: BookWithContent | null }): Promise<GenerationResult> => {
+  const run = response.generationRun ?? response.run;
+  if (!run) throw new Error("Generation response did not include a run.");
+  const book = response.book ?? (run.bookId ? await getBookById(run.bookId) : null);
+  return { run, book };
+};
+
+const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
 export const api = {
   health: () => request<{ ok: boolean; service: string }>("/api/health"),
   listBooks: async (filter: BookFilter = "all") => unwrap<BookWithContent[]>(await request(`/api/books?filter=${filter}`), "books"),
-  getBook: async (bookId: string) => {
-    const payload = await request(`/api/books/${bookId}`);
-    const book = unwrap<BookWithContent>(payload, "book");
-    const readingState = payload && typeof payload === "object" ? (payload as { readingState?: ReadingState }).readingState : undefined;
-    return { ...book, readingState };
-  },
+  getBook: getBookById,
   saveReadingState: (bookId: string, payload: Partial<ReadingState>) =>
     request<{ readingState?: ReadingState } | ReadingState>(`/api/reading-state/${bookId}`, {
       method: "PATCH",
@@ -75,8 +87,11 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(payload)
     }).then((value) => unwrap<UIState>(value, "uiState")),
-  generateOutline: async (payload: GenerationInput) => {
-    const response = await request<{ generationRun?: GenerationRun; run?: GenerationRun; book?: BookWithContent }>("/api/generation/outline", {
+  getGenerationRun: async (runId: string) => normalizeGenerationResult(await request(`/api/generation/runs/${runId}`)),
+  retryFailedGenerationChapters: async (runId: string) =>
+    normalizeGenerationResult(await request(`/api/generation/runs/${runId}/retry-failed-chapters`, { method: "POST" })),
+  generateOutline: async (payload: GenerationInput, onUpdate?: (result: GenerationResult) => void) => {
+    const response = await request<{ generationRun?: GenerationRun; run?: GenerationRun; book?: BookWithContent | null }>("/api/generation/runs", {
       method: "POST",
       body: JSON.stringify({
         repoUrl: payload.repositoryUrl,
@@ -84,14 +99,22 @@ export const api = {
         audience: payload.audience,
         depth: payload.depth,
         branch: "main",
-        context: payload.depth === "deep" ? "128k" : "64k"
+        context: payload.depth === "deep" ? "128k" : "64k",
+        background: payload.background ?? true
       })
     });
-    const run = response.generationRun ?? response.run;
-    if (!run) throw new Error("Generation response did not include a run.");
-    const book = response.book ?? (run.bookId ? await api.getBook(run.bookId) : undefined);
-    if (!book) throw new Error("Generation response did not include a book draft.");
-    return { run, book };
+    let result = await normalizeGenerationResult(response);
+    onUpdate?.(result);
+
+    while (result.run.status === "queued" || result.run.status === "running") {
+      await delay(500);
+      result = await api.getGenerationRun(result.run.id);
+      onUpdate?.(result);
+    }
+
+    if (result.run.status === "failed") throw new Error(result.run.error || "목차 생성에 실패했습니다.");
+    if (!result.book) throw new Error("Generation response did not include a book draft.");
+    return result;
   },
   listTutorThreads: async (bookId: string, chapterId: string) =>
     unwrap<TutorThreadWithMessages[]>(await request(`/api/tutor/threads?bookId=${bookId}&chapterId=${chapterId}`), "threads"),

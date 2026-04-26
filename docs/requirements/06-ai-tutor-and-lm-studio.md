@@ -6,8 +6,8 @@ Repo Books의 AI는 저장소를 기술서적 형태로 변환하고, 사용자�
 
 AI가 수행하는 핵심 작업은 다음과 같다.
 
-- 저장소 구조를 분석해 책 제목, Part, Chapter 목차를 만든다.
-- 각 Chapter를 기술서적처럼 읽히는 본문으로 생성한다.
+- 저장소 구조를 분석해 책 제목, Part, Chapter 계획을 만든다.
+- 각 Chapter를 5-8개 section을 가진 기술서적 본문으로 생성한다.
 - 본문 설명과 관련 파일, 코드 앵커를 연결한다.
 - 독자가 읽는 중 질문하면 현재 Chapter 컨텍스트를 우선해 답한다.
 - 생성 실패 또는 컨텍스트 부족 상태를 명확히 알리고 재시도 가능한 정보를 제공한다.
@@ -54,9 +54,21 @@ AI는 저장소 전체를 한 번에 모델에 넣지 않고 단계별 컨텍스
 - 모델 컨텍스트 한계를 초과하지 않도록 청크와 요약을 사용한다.
 - 저장소에 없는 내용을 확정적으로 말하지 않는다.
 
-## 책 목차 생성 프롬프트 요구사항
+## 다단계 책 생성 요구사항
 
-목차 생성 시 AI는 다음 입력을 받아야 한다.
+책 생성 시 AI는 한 번의 긴 응답으로 책을 만들지 않고, 구조화된 단계별 응답을 반환해야 한다.
+
+| 단계 | 입력 | 출력 |
+| --- | --- | --- |
+| part plan | repo archetype, README/docs 요약, manifest, entry files, top-level responsibility map | 4-7개 Part와 학습 목적 |
+| chapter plan | Part 목적, 관련 파일 후보, 전체 책 arc | Part당 3-6개 Chapter, 핵심 질문, 범위/제외 범위 |
+| chapter brief | Chapter 계획, evidence file slice, repository analysis | 책임, 흐름, code anchor, evidence, glossary, recap |
+| section plan | Chapter brief와 관련 파일 | 5-8개 section 설계 |
+| section draft | section 목적, evidence slice, 이전 section 요약 | 장문 section 본문 |
+| chapter revision | section draft 전체 | 중복 제거, 흐름 보강, 근거 누락 수리 |
+| coherence pass | 책 전체 요약 | 용어, 순서, recap, 다음 장 연결 점검 |
+
+각 단계의 입력은 다음 공통 정보를 포함할 수 있다.
 
 - 저장소 URL 또는 경로
 - 저장소 구조 요약
@@ -73,15 +85,14 @@ AI는 저장소 전체를 한 번에 모델에 넣지 않고 단계별 컨텍스
 
 | 필드 | 설명 |
 | --- | --- |
-| bookTitle | 책 제목 |
-| subtitle | 짧은 부제 |
-| overview | 책 전체 요약 |
-| audience | 예상 독자 |
 | parts | Part 목록 |
 | chapters | Chapter 목록 |
 | objectives | 각 Chapter의 읽기 목표 |
 | relatedFiles | 관련 파일 목록 |
 | codeAnchors | 본문과 연결할 코드 근거 |
+| evidence | 파일별 역할과 본문 근거 |
+| glossary | 저장소 문맥 용어 |
+| recap | 이해한 것, 변경 시 볼 지점, 다음 질문 |
 | checkpoints | 이해 확인 체크포인트 |
 | estimatedMinutes | 예상 읽기 시간 |
 
@@ -93,12 +104,13 @@ Chapter 생성 시 AI는 다음을 제공해야 한다.
 - 저장소에서 이 Chapter가 필요한 이유
 - 관련 파일과 코드 앵커
 - 기술서적처럼 이어지는 설명 본문
+- 5-8개 section으로 나뉜 충분한 분량의 본문
 - 실행 흐름 또는 데이터 흐름
 - 독자가 놓치기 쉬운 설계 포인트
 - 체크포인트
 - 다음 Chapter로 이어지는 짧은 연결 문장
 
-본문은 단순한 파일 요약이 아니라 독자가 이해할 순서로 재구성해야 한다.
+본문은 단순한 파일 요약이 아니라 독자가 이해할 순서로 재구성해야 한다. 모든 중요한 단정은 `filePath`, `symbolName`, `route`, `configKey`, `testTarget` 중 하나와 연결되어야 한다.
 
 ## AI Tutor 패널 요구사항
 
@@ -115,11 +127,12 @@ AI Tutor는 읽기 화면의 여백 또는 bottom sheet에서 동작한다.
 
 | 상황 | 처리 |
 | --- | --- |
-| LM Studio 연결 실패 | 책장에는 연결 실패 상태, 목차 생성 화면에는 설정 확인과 재시도 제공 |
-| 모델 응답 실패 | 분석 결과를 유지하고 같은 입력으로 재생성 가능 |
+| LM Studio 연결 실패 | 생성 화면에는 설정 확인과 재시도 가능한 상태 표시 |
+| 모델 응답 실패 | 단계별 artifact와 분석 결과를 유지하고 실패 단계부터 재시도 가능 |
 | 컨텍스트 초과 | 파일 범위를 줄이거나 요약 후 재시도 |
-| 불완전한 JSON | 원문 응답을 보존하고 구조화 재시도 |
-| 일부 Chapter 생성 실패 | 생성된 Part/Chapter는 유지하고 실패 Chapter만 재시도 |
+| 불완전한 JSON | 구조화 재시도 후 실패 artifact 기록 |
+| 일부 Chapter 생성 실패 | 생성된 Part/Chapter는 유지하고 실패 Chapter만 `failed`로 표시 |
+| 실패 Chapter retry | 저장된 brief/evidence/code anchor를 사용해 해당 Chapter만 재생성 |
 
 ## 품질 가드레일
 
@@ -128,3 +141,4 @@ AI Tutor는 읽기 화면의 여백 또는 bottom sheet에서 동작한다.
 - AI는 책의 흐름을 우선하고, 채팅 중심 제품처럼 과도하게 대화를 유도하지 않는다.
 - AI는 코드 앵커가 없는 설명을 일반론처럼 표시하지 않는다.
 - AI는 독자의 수준에 맞추되 중요한 설계 흐름을 생략하지 않는다.
+- AI는 prompt, JSON parsing, adapter, 모델 응답 같은 생성 내부 표현을 책 본문에 쓰지 않는다.

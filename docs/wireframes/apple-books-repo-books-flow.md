@@ -79,9 +79,9 @@ Repo Books는 GitHub 저장소를 책으로 변환해 읽는 ebook 앱이다. �
 | LM Studio 모델 / 독자 수준 / 생성 깊이                                             |
 |                                                                                  |
 | 분석 진행 상태                      생성된 책 목차                                  |
-| [scan -> toc -> chapter]            Part 1. 시작하기                               |
-|                                     - 1.1 저장소가 해결하는 문제                    |
-|                                     - 1.2 폴더를 대단원으로 바꾸기                   |
+| [analysis -> part -> chapter]       Part 1. 시작하기                               |
+| [brief -> draft -> repair]          - 1.1 저장소가 해결하는 문제                    |
+| [coherence]                         - 1.2 폴더를 대단원으로 바꾸기                   |
 |                                     Part 2. 핵심 흐름 읽기                           |
 +----------------------------------------------------------------------------------+
 ```
@@ -106,8 +106,8 @@ Repo Books는 GitHub 저장소를 책으로 변환해 읽는 ebook 앱이다. �
 flowchart TD
   A["책장"] --> B["새 책 진입(sidebar 또는 bottom nav)"]
   B --> C["목차 생성"]
-  C --> D["LM Studio 저장소 스캔"]
-  D --> E["Part/Chapter 목차 생성"]
+  C --> D["저장소 분석과 evidence 색인"]
+  D --> E["Part/Chapter/Section 다단계 생성"]
   E --> F["읽기 시작"]
   F --> G["읽기 화면"]
   G --> H["목차 panel 또는 sheet"]

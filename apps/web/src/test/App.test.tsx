@@ -49,6 +49,59 @@ const book = {
       sections: [{ eyebrow: "흐름", title: "파일 트리는 지도다", body: "목차는 독자의 여행 일정입니다." }],
       files: ["docs/requirements"],
       code: { path: "packages/shared/src/index.ts", label: "목차 fixture", lines: ["const baseChapters = [];"] },
+      keyQuestion: "폴더 책임은 책의 장 구조로 어떻게 바뀌는가?",
+      responsibility: "docs/requirements와 packages/shared/src/index.ts가 저장소 이해 구조를 함께 만든다.",
+      flow: {
+        type: "architecture",
+        title: "요구사항에서 책 본문으로 이어지는 흐름",
+        summary: "요구사항 문서가 챕터 구조를 정하고 shared schema가 reader에 전달한다.",
+        diagram: "flowchart TD\n  A[docs/requirements] --> B[packages/shared/src/index.ts]"
+      },
+      codeAnchors: [
+        {
+          filePath: "packages/shared/src/index.ts",
+          symbolName: "bookChapterSchema",
+          lineHint: "L45",
+          claim: "packages/shared/src/index.ts는 챕터 구조의 public contract를 증명한다.",
+          explanation: "bookChapterSchema가 reader와 API가 공유하는 필드를 고정한다.",
+          excerptLines: ["export const bookChapterSchema = z.object({", "  sections: z.array(textSectionSchema)", "});"]
+        },
+        {
+          filePath: "docs/requirements/04-repo-book-structure.md",
+          symbolName: "Chapter 본문 패턴",
+          lineHint: "L1-L80",
+          claim: "docs/requirements/04-repo-book-structure.md는 챕터가 기술서 흐름을 가져야 한다는 요구를 증명한다.",
+          explanation: "본문 패턴과 코드 앵커 요구사항이 UI 구조의 기준이 된다.",
+          excerptLines: ["# Repo Book 구조와 체크포인트 요구사항"]
+        }
+      ],
+      evidence: [
+        {
+          filePath: "docs/requirements/04-repo-book-structure.md",
+          role: "책 구조 요구사항",
+          usedAsEvidence: "Chapter 본문 패턴과 코드 앵커 요구를 제공한다.",
+          outOfScope: ""
+        },
+        {
+          filePath: "packages/shared/src/index.ts",
+          role: "공유 데이터 계약",
+          usedAsEvidence: "BookChapter schema를 통해 API와 UI 필드를 고정한다.",
+          outOfScope: ""
+        }
+      ],
+      glossary: [
+        {
+          term: "BookChapter",
+          meaning: "reader가 한 장을 렌더링하기 위해 받는 공유 데이터 단위",
+          appearsIn: "packages/shared/src/index.ts",
+          relatedAnchors: ["packages/shared/src/index.ts"]
+        }
+      ],
+      recap: {
+        understood: ["요구사항과 schema가 챕터 구조를 함께 정한다."],
+        changeEntryPoints: ["packages/shared/src/index.ts · bookChapterSchema"],
+        nextQuestions: ["본문 구조를 생성기가 어떻게 채우는가?"]
+      },
       notes: [],
       checkpoints: ["대단원 이름 확정"],
       estimatedMinutes: 21,
@@ -70,6 +123,10 @@ const uiState = {
 };
 
 beforeEach(() => {
+  Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+    configurable: true,
+    value: vi.fn()
+  });
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -88,7 +145,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  vi.unstubAllGlobals();
+  vi.clearAllMocks();
 });
 
 describe("Repo Books web app", () => {
@@ -118,6 +175,20 @@ describe("Repo Books web app", () => {
     await waitFor(() => {
       expect(fetch).toHaveBeenCalledWith("/api/books?filter=draft", expect.anything());
     });
+  });
+
+  it("renders structured chapter body, evidence, and multiple code anchors", async () => {
+    render(
+      <MemoryRouter initialEntries={["/books/repo-books-book/chapters/chapter-1-2"]}>
+        <App />
+      </MemoryRouter>
+    );
+
+    expect(await screen.findByRole("heading", { name: "폴더를 대단원으로 바꾸기" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "폴더 책임은 책의 장 구조로 어떻게 바뀌는가?" })).toBeInTheDocument();
+    expect(screen.getByText("요구사항에서 책 본문으로 이어지는 흐름")).toBeInTheDocument();
+    expect(screen.getByText("packages/shared/src/index.ts는 챕터 구조의 public contract를 증명한다.")).toBeInTheDocument();
+    expect(screen.getByText("BookChapter")).toBeInTheDocument();
   });
 });
 

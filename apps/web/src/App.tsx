@@ -19,6 +19,7 @@ import {
   MessageSquareText,
   Palette,
   Plus,
+  RefreshCcw,
   SendHorizontal,
   Settings2,
   Sparkles,
@@ -78,10 +79,13 @@ const STATUS_LABELS: Record<string, string> = {
 };
 
 const GENERATION_STEPS: Array<{ id: string; label: string; detail: string }> = [
-  { id: "scan", label: "저장소 입력 검증", detail: "URL, 모델, 독자 수준 확인" },
-  { id: "toc", label: "대단원 초안", detail: "파일 트리가 아니라 학습 순서로 재배열" },
-  { id: "chapter", label: "챕터별 코드 근거", detail: "관련 파일과 코드 앵커를 목차에 연결" },
-  { id: "done", label: "책 초안 저장", detail: "SQLite에 이어 읽기 가능한 상태로 저장" }
+  { id: "analysis", label: "저장소 분석", detail: "색인, entrypoint, repo archetype 추출" },
+  { id: "part", label: "대단원 설계", detail: "저장소 전체 arc와 대단원 목적 구성" },
+  { id: "chapter", label: "소단원 설계", detail: "대단원별 핵심 질문과 선후 관계 구성" },
+  { id: "brief", label: "근거 수집", detail: "파일 근거, 코드 앵커, glossary 후보 연결" },
+  { id: "draft", label: "본문 생성", detail: "section plan과 section draft를 순차 생성" },
+  { id: "repair", label: "챕터 수리", detail: "중복 제거, 근거 누락, 흐름 보강" },
+  { id: "coherence", label: "책 일관성 점검", detail: "용어, recap, 다음 장 연결 확인" }
 ];
 
 const GENERATION_FORM_DEFAULT = {
@@ -337,8 +341,10 @@ export function App() {
               onBack={goToLibrary}
               onReadBook={(bookId, chapterId) => void openBook(bookId, chapterId)}
               onGenerated={(result) => {
-                setActiveBook(result.book);
-                setBooks((current) => upsertBook(current, result.book));
+                const generatedBook = result.book;
+                if (!generatedBook) return;
+                setActiveBook(generatedBook);
+                setBooks((current) => upsertBook(current, generatedBook));
               }}
             />
           }
@@ -767,18 +773,22 @@ function GenerationView({
   const [form, setForm] = useState(GENERATION_FORM_DEFAULT);
   const [result, setResult] = useState<GenerationResult | null>(null);
   const [running, setRunning] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const displayBook = result?.book ?? activeBook;
   const canReadBook = Boolean(displayBook) && !running;
+  const failedChapterCount = result?.run.chapterRuns?.filter((chapter) => chapter.status === "failed").length ?? 0;
+  const canRetryFailedChapters = Boolean(result?.run.id) && failedChapterCount > 0 && !running && !retrying;
 
   async function runGenerate(event?: FormEvent) {
     event?.preventDefault();
     setRunning(true);
+    setResult(null);
     setError(null);
     try {
-      const nextResult = await api.generateOutline(form);
+      const nextResult = await api.generateOutline(form, setResult);
       setResult(nextResult);
-      onGenerated(nextResult);
+      if (nextResult.book) onGenerated(nextResult);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "목차 생성에 실패했습니다.");
     } finally {
@@ -786,7 +796,22 @@ function GenerationView({
     }
   }
 
-  const runPhase = result ? generationRunPhase(result.run.status) : running ? "toc" : "scan";
+  async function retryFailedChapters() {
+    if (!result?.run.id) return;
+    setRetrying(true);
+    setError(null);
+    try {
+      const nextResult = await api.retryFailedGenerationChapters(result.run.id);
+      setResult(nextResult);
+      if (nextResult.book) onGenerated(nextResult);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "실패한 챕터 재시도에 실패했습니다.");
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  const runPhase = result ? generationRunPhase(result.run.status) : running ? "part" : "analysis";
   const displaySteps: GenerationStep[] =
     result?.run.steps ??
     GENERATION_STEPS.map((step) => ({
@@ -857,6 +882,10 @@ function GenerationView({
                 {running ? <Loader2 className="spin" /> : <Sparkles />}
                 <span>{running ? "생성 중" : "다시 생성"}</span>
               </button>
+              <button className="secondary-action" type="button" onClick={retryFailedChapters} disabled={!canRetryFailedChapters}>
+                {retrying ? <Loader2 className="spin" /> : <RefreshCcw />}
+                <span>실패 챕터 재시도</span>
+              </button>
               <button
                 className="secondary-action"
                 type="button"
@@ -904,6 +933,29 @@ function GenerationView({
               );
             })}
           </div>
+          {result ? (
+            <div className="run-progress" aria-label="생성 진행률">
+              <span>{result.run.progress}%</span>
+              <div className="progress-track">
+                <span style={{ width: `${result.run.progress}%` }} />
+              </div>
+            </div>
+          ) : null}
+          {result?.run.chapterRuns?.length ? (
+            <div className="chapter-job-list" aria-label="챕터 생성 작업">
+              <div className="chapter-job-list__header">
+                <span>Chapter jobs</span>
+                {failedChapterCount ? <strong>{failedChapterCount} failed</strong> : <strong>complete</strong>}
+              </div>
+              {result.run.chapterRuns.slice(0, 6).map((chapter) => (
+                <div key={chapter.id} className={`chapter-job is-${chapter.status}`}>
+                  <span className="state-dot" />
+                  <span>{chapter.title}</span>
+                  <small>{chapter.status} · {chapter.source}</small>
+                </div>
+              ))}
+            </div>
+          ) : null}
           <dl className="metric-list">
             <div>
               <dt>Context</dt>
@@ -1310,6 +1362,8 @@ function ReaderToc({
 }
 
 function BookPage({ book, chapter }: { book: BookWithContent; chapter: BookChapter }) {
+  const structured = hasStructuredChapterBody(chapter);
+  const anchors = codeAnchors(chapter);
   const code = firstCodeAnchor(chapter);
   return (
     <article className="book-page" id="book-page" aria-labelledby="reader-title" aria-live="polite">
@@ -1336,28 +1390,92 @@ function BookPage({ book, chapter }: { book: BookWithContent; chapter: BookChapt
         </ol>
       </section>
 
+      {structured ? (
+        <section className="chapter-brief" aria-label="챕터 핵심 질문">
+          <div>
+            <p className="eyebrow">핵심 질문</p>
+            <h2>{chapter.keyQuestion}</h2>
+          </div>
+          <p>{chapter.responsibility}</p>
+        </section>
+      ) : null}
+
       <section className="reading-flow" aria-label="챕터 본문">
         {sections(chapter).map((section) => (
           <article className="chapter-section" key={`${section.eyebrow}-${section.title}`}>
             <p className="eyebrow">{section.eyebrow}</p>
             <h2>{section.title}</h2>
-            <p>{section.body}</p>
+            <div className="section-body">
+              {proseParagraphs(section.body).map((paragraph, index) => (
+                <p key={`${section.title}-${index}`}>{paragraph}</p>
+              ))}
+            </div>
           </article>
         ))}
       </section>
+
+      {structured && chapter.flow ? (
+        <section className="flow-panel" aria-label="챕터 흐름">
+          <div className="section-title">
+            <ListTree />
+            <span>{chapter.flow.title}</span>
+          </div>
+          <p>{chapter.flow.summary}</p>
+          {chapter.flow.diagram ? <pre className="flow-diagram">{chapter.flow.diagram}</pre> : null}
+        </section>
+      ) : null}
 
       <section className="code-panel" aria-label="코드 근거">
         <div className="code-toolbar">
           <div>
             <FileCode2 />
-            <span title={code.path}>{code.path}</span>
+            <span title={anchors[0]?.filePath ?? code.path}>{anchors[0]?.filePath ?? code.path}</span>
           </div>
-          <span>{code.label}</span>
+          <span>{anchors.length ? `${anchors.length} anchors` : code.label}</span>
         </div>
-        <pre>
-          <code>{code.lines.join("\n")}</code>
-        </pre>
+        {anchors.length ? (
+          <div className="anchor-stack">
+            {anchors.map((anchor) => (
+              <article className="code-anchor" key={`${anchor.filePath}-${anchor.symbolName}-${anchor.lineHint}`}>
+                <div>
+                  <strong>{anchor.symbolName || anchor.filePath}</strong>
+                  <span>{anchor.filePath}{anchor.lineHint ? ` · ${anchor.lineHint}` : ""}</span>
+                </div>
+                <p>{anchor.claim}</p>
+                <p>{anchor.explanation}</p>
+                {anchor.excerptLines.length ? (
+                  <pre>
+                    <code>{anchor.excerptLines.join("\n")}</code>
+                  </pre>
+                ) : null}
+              </article>
+            ))}
+          </div>
+        ) : (
+          <pre>
+            <code>{code.lines.join("\n")}</code>
+          </pre>
+        )}
       </section>
+
+      {structured ? (
+        <section className="evidence-panel" aria-label="파일 근거">
+          <div className="section-title">
+            <File />
+            <span>근거와 범위</span>
+          </div>
+          <div className="evidence-table">
+            {evidenceRows(chapter).map((item) => (
+              <article key={`${item.filePath}-${item.role}`}>
+                <strong>{item.filePath}</strong>
+                <span>{item.role}</span>
+                <p>{item.usedAsEvidence}</p>
+                {item.outOfScope ? <small>{item.outOfScope}</small> : null}
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <section className="checkpoint-panel" aria-label="챕터 체크포인트">
         <div className="section-title">
@@ -1373,6 +1491,38 @@ function BookPage({ book, chapter }: { book: BookWithContent; chapter: BookChapt
           ))}
         </div>
       </section>
+
+      {structured ? (
+        <section className="recap-panel" aria-label="챕터 요약">
+          <div className="section-title">
+            <BookmarkCheck />
+            <span>Recap</span>
+          </div>
+          <div className="recap-grid">
+            <article>
+              <strong>이제 이해한 것</strong>
+              <ul>{recapItems(chapter, "understood").map((item) => <li key={item}>{item}</li>)}</ul>
+            </article>
+            <article>
+              <strong>변경 시 볼 지점</strong>
+              <ul>{recapItems(chapter, "changeEntryPoints").map((item) => <li key={item}>{item}</li>)}</ul>
+            </article>
+            <article>
+              <strong>다음 질문</strong>
+              <ul>{recapItems(chapter, "nextQuestions").map((item) => <li key={item}>{item}</li>)}</ul>
+            </article>
+          </div>
+          {glossaryEntries(chapter).length ? (
+            <div className="glossary-list">
+              {glossaryEntries(chapter).map((entry) => (
+                <span key={`${entry.term}-${entry.appearsIn}`} title={entry.meaning}>
+                  {entry.term}
+                </span>
+              ))}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
 
       <footer className="page-foot">
         <span>{book.title}</span>
@@ -1596,19 +1746,46 @@ function sections(chapter: BookChapter) {
   );
 }
 
+function proseParagraphs(body: string) {
+  return body
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.replace(/\s*\n\s*/g, " ").trim())
+    .filter(Boolean);
+}
+
 function relatedFiles(chapter: BookChapter) {
   const legacy = chapter as unknown as { relatedFiles?: string[]; files?: string[] };
   return legacy.relatedFiles?.length ? legacy.relatedFiles : (legacy.files ?? []);
+}
+
+function hasStructuredChapterBody(chapter: BookChapter) {
+  return Boolean(chapter.keyQuestion || chapter.responsibility || chapter.flow || chapter.codeAnchors?.length || chapter.evidence?.length || chapter.recap);
+}
+
+function codeAnchors(chapter: BookChapter) {
+  return chapter.codeAnchors ?? [];
 }
 
 function firstCodeAnchor(chapter: BookChapter) {
   const fromAnchors = (chapter as unknown as { codeAnchors?: Array<{ path?: string; label?: string; lines?: string[] }> }).codeAnchors?.[0];
   const fromLegacy = (chapter as unknown as { code?: { path?: string; label?: string; lines?: string[] } }).code;
   return {
-    path: fromAnchors?.path ?? fromLegacy?.path ?? relatedFiles(chapter)[0] ?? "README.md",
-    label: fromAnchors?.label ?? fromLegacy?.label ?? "코드 근거",
-    lines: fromAnchors?.lines ?? fromLegacy?.lines ?? ["// 저장소 색인 결과에서 코드 근거를 추출하는 중입니다."]
+    path: (fromAnchors as { filePath?: string } | undefined)?.filePath ?? fromAnchors?.path ?? fromLegacy?.path ?? relatedFiles(chapter)[0] ?? "README.md",
+    label: (fromAnchors as { claim?: string } | undefined)?.claim ?? fromAnchors?.label ?? fromLegacy?.label ?? "코드 근거",
+    lines: (fromAnchors as { excerptLines?: string[] } | undefined)?.excerptLines ?? fromAnchors?.lines ?? fromLegacy?.lines ?? ["// 저장소 색인 결과에서 코드 근거를 추출하는 중입니다."]
   };
+}
+
+function evidenceRows(chapter: BookChapter) {
+  return chapter.evidence ?? [];
+}
+
+function glossaryEntries(chapter: BookChapter) {
+  return chapter.glossary ?? [];
+}
+
+function recapItems(chapter: BookChapter, key: "understood" | "changeEntryPoints" | "nextQuestions") {
+  return chapter.recap?.[key] ?? [];
 }
 
 function checkpoints(chapter: BookChapter) {
@@ -1627,20 +1804,20 @@ function mentorNotes(chapter: BookChapter) {
 }
 
 function generationStepState(stepId: string, phase: string, hasRun: boolean): RunStepState {
-  const order = ["scan", "toc", "chapter", "done"];
+  const order = ["analysis", "part", "chapter", "brief", "draft", "repair", "coherence"];
   const phaseIndex = order.indexOf(phase);
   const stepIndex = order.indexOf(stepId);
-  if (!hasRun && stepId !== "scan") return "pending";
-  if (phase === "failed") return stepId === "scan" ? "failed" : "pending";
-  if (stepIndex < phaseIndex || phase === "done") return "complete";
+  if (!hasRun && stepId !== "analysis") return "pending";
+  if (phase === "failed") return stepId === "analysis" ? "failed" : "pending";
+  if (stepIndex < phaseIndex || phase === "coherence") return "complete";
   if (stepIndex === phaseIndex) return "active";
   return "pending";
 }
 
 function generationRunPhase(status: string) {
-  if (status === "complete") return "done";
+  if (status === "complete") return "coherence";
   if (status === "failed") return "failed";
-  return "toc";
+  return "draft";
 }
 
 function stepIcon(state: RunStepState) {

@@ -47,6 +47,9 @@
 | sections | 본문 섹션 목록 |
 | relatedFiles | 관련 파일 목록 |
 | codeAnchors | 코드 앵커 목록 |
+| evidence | 파일별 역할과 본문 근거 |
+| glossary | 저장소 문맥 용어 |
+| recap | 이해한 것, 변경 시 볼 지점, 다음 질문 |
 | checkpoints | 체크포인트 목록 |
 | estimatedMinutes | 예상 읽기 시간 |
 | status | `not_started`, `in_progress`, `current`, `completed`, `failed` |
@@ -60,12 +63,24 @@
 | bookId | 책 ID |
 | repositorySnapshotId | 분석 스냅샷 ID |
 | model | 사용 모델 |
-| phase | `scan`, `toc`, `chapter`, `repair`, `done`, `failed` |
+| phase | `저장소 분석`, `대단원 설계`, `소단원 설계`, `근거 수집`, `본문 생성`, `챕터 수리`, `책 일관성 점검`, `failed` |
 | progressPercent | 생성 진행률 |
 | errorMessage | 실패 메시지 |
-| rawResponseRef | 원문 응답 보존 위치 |
+| artifacts | 단계별 생성 산출물 목록 |
 | createdAt | 생성 시작 시각 |
 | completedAt | 완료 시각 |
+
+### GenerationArtifact
+
+| 필드 | 설명 |
+| --- | --- |
+| id | artifact ID |
+| runId | 생성 실행 ID |
+| chapterId | 관련 Chapter ID, 책 전체 단계이면 없음 |
+| kind | `repository_analysis`, `part_plan`, `chapter_plan`, `chapter_brief`, `section_plan`, `section_draft`, `chapter_revision`, `book_coherence`, `quality_issues` 등 |
+| order | run 안에서의 기록 순서 |
+| payload | 단계별 구조화 JSON |
+| createdAt | 생성 시각 |
 
 ### ReadingState
 
@@ -119,7 +134,8 @@
 다음 데이터는 실시간 또는 짧은 지연 저장 방식으로 보존한다.
 
 - 책 생성 입력값
-- 생성된 목차와 Chapter 본문
+- 생성된 목차, Chapter 본문, structured chapter body
+- 생성 단계별 artifact와 품질 이슈
 - 최근 읽은 책 순서
 - 현재 Chapter 위치
 - 본문 스크롤 위치
@@ -153,7 +169,7 @@
 | 최근 읽은 책 갱신 | Chapter 열람 후 즉시 반영 |
 | Reader 전환 | 저장된 Chapter 기준 1초 이내 |
 | AI 응답 | 스트리밍 또는 생성 중 표시 제공 |
-| 저장소 분석 | 진행률과 현재 단계 표시 |
+| 저장소 분석/책 생성 | 진행률과 현재 단계 표시 |
 | 긴 저장소 처리 | 파일 제외, 청크, 요약으로 컨텍스트 크기 제어 |
 
 ## 접근성 요구사항
@@ -170,8 +186,8 @@
 | --- | --- |
 | 저장소 URL/경로 오류 | 입력 확인 메시지와 재입력 안내 |
 | LM Studio 연결 오류 | 책장 상태 표시, 설정 확인, 재시도 제공 |
-| 모델 응답 오류 | 재시도 버튼과 오류 상세 보기 |
-| 목차 생성 실패 | 분석 결과 유지 후 재생성 가능 |
+| 모델 응답 오류 | 단계별 artifact, 재시도 버튼, 오류 상세 보기 |
+| 책 생성 실패 | 분석 결과와 생성 artifact 유지 후 재생성 가능 |
 | Chapter 생성 실패 | 해당 Chapter만 재시도 가능 |
 | 저장 실패 | 자동 재시도와 사용자 알림 |
 | 컨텍스트 초과 | 관련 파일 축소 또는 요약 후 재시도 |

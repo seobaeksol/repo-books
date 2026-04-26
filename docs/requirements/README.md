@@ -9,14 +9,14 @@
 | [01-product-overview.md](./01-product-overview.md) | 제품 목표, 사용자, 범위, 핵심 용어 |
 | [02-user-flows.md](./02-user-flows.md) | 책장, 새 책 생성, 목차 생성, 읽기 흐름 |
 | [03-functional-requirements.md](./03-functional-requirements.md) | 기능 요구사항과 수용 기준 |
-| [04-repo-book-structure.md](./04-repo-book-structure.md) | 책 목차, 챕터, 체크포인트 요구사항 |
+| [04-repo-book-structure.md](./04-repo-book-structure.md) | 책 구조, 챕터 본문, 근거/체크포인트 요구사항 |
 | [05-apple-books-ui.md](./05-apple-books-ui.md) | Apple Books형 책장과 읽기 UI 요구사항 |
 | [06-ai-tutor-and-lm-studio.md](./06-ai-tutor-and-lm-studio.md) | LM Studio 기반 책 생성과 AI margin tutor 요구사항 |
 | [07-data-and-nonfunctional-requirements.md](./07-data-and-nonfunctional-requirements.md) | 데이터 모델, 저장, 접근성, 비기능 요구사항 |
 
 ## 제품 한 줄 설명
 
-Repo Books는 GitHub 저장소를 LM Studio 모델로 분석해 대단원/챕터 목차를 가진 repo book으로 만들고, 사용자가 Apple Books 같은 책장과 reader에서 코드를 책처럼 읽으며 AI에게 질문할 수 있게 하는 웹앱이다.
+Repo Books는 GitHub 저장소를 다단계 생성 파이프라인으로 분석해 대단원, 소단원, 근거 기반 본문을 가진 repo book으로 만들고, 사용자가 Apple Books 같은 책장과 reader에서 코드를 기술서처럼 읽으며 AI에게 질문할 수 있게 하는 웹앱이다.
 
 ## 우선순위 기준
 

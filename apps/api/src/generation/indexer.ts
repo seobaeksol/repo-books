@@ -10,6 +10,15 @@ export type IndexedFile = {
   lineCount: number;
   headings: string[];
   symbols: string[];
+  symbolDetails: Array<{ name: string; kind: string; line: number; signature: string }>;
+  imports: string[];
+  exports: string[];
+  commands: string[];
+  dependencies: string[];
+  features: string[];
+  configKeys: string[];
+  routes: string[];
+  testTargets: string[];
   packageName: string | null;
   preview: string;
   lines: string[];
@@ -145,6 +154,15 @@ function indexFile(rootPath: string, path: string): IndexedFile | null {
     lineCount: lines.length,
     headings: extractHeadings(lines),
     symbols: extractSymbols(lines),
+    symbolDetails: extractSymbolDetails(lines),
+    imports: extractImports(lines),
+    exports: extractExports(lines),
+    commands: extractCommands(path, raw, lines),
+    dependencies: extractDependencies(path, raw),
+    features: extractFeatures(path, raw),
+    configKeys: extractConfigKeys(path, lines),
+    routes: extractRoutes(lines),
+    testTargets: extractTestTargets(path, lines),
     packageName: path.endsWith("Cargo.toml") ? extractCargoPackageName(raw) : null,
     preview: lines.slice(0, 80).join("\n"),
     lines: lines.slice(0, 260)
@@ -176,6 +194,123 @@ function extractSymbols(lines: string[]) {
     .map((line) => line.match(/^\s*(?:pub\s+)?(?:async\s+)?(?:struct|enum|trait|fn|mod|type|const|macro_rules!)\s+([A-Za-z0-9_]+)/)?.[0]?.trim())
     .filter((value): value is string => Boolean(value))
     .slice(0, 20);
+}
+
+function extractSymbolDetails(lines: string[]) {
+  return lines
+    .map((line, index) => {
+      const match = line.match(/^\s*(?:export\s+)?(?:pub\s+)?(?:async\s+)?(struct|enum|trait|fn|function|class|interface|type|const|mod|macro_rules!)\s+([A-Za-z0-9_]+)/);
+      if (!match?.[1] || !match[2]) return null;
+      return {
+        name: match[2],
+        kind: match[1],
+        line: index + 1,
+        signature: line.trim()
+      };
+    })
+    .filter((value): value is { name: string; kind: string; line: number; signature: string } => Boolean(value))
+    .slice(0, 32);
+}
+
+function extractImports(lines: string[]) {
+  return lines
+    .map((line) => line.match(/^\s*(?:use|import)\s+(.+?);?$/)?.[1]?.trim())
+    .filter((value): value is string => Boolean(value))
+    .slice(0, 24);
+}
+
+function extractExports(lines: string[]) {
+  return lines
+    .map((line) => line.match(/^\s*(?:pub\s+use|export\s+(?:\{.*\}\s+from|(?:const|function|class|type|interface)))\s+(.+?);?$/)?.[0]?.trim())
+    .filter((value): value is string => Boolean(value))
+    .slice(0, 24);
+}
+
+function extractCommands(path: string, raw: string, lines: string[]) {
+  if (path.endsWith("package.json")) {
+    const parsed = parseJsonObject(raw);
+    const scripts = parsed?.scripts && typeof parsed.scripts === "object" ? (parsed.scripts as Record<string, unknown>) : {};
+    return Object.entries(scripts)
+      .map(([name, command]) => `${name}: ${String(command)}`)
+      .slice(0, 24);
+  }
+  return lines
+    .map((line) => line.match(/`([^`]*(?:pnpm|npm|yarn|cargo|node|tsx|vite|vitest|playwright|make|python)[^`]*)`/)?.[1]?.trim())
+    .filter((value): value is string => Boolean(value))
+    .slice(0, 24);
+}
+
+function extractDependencies(path: string, raw: string) {
+  if (path.endsWith("package.json")) {
+    const parsed = parseJsonObject(raw);
+    return ["dependencies", "devDependencies"]
+      .flatMap((key) => {
+        const value = parsed?.[key];
+        return value && typeof value === "object" ? Object.keys(value as Record<string, unknown>) : [];
+      })
+      .slice(0, 40);
+  }
+  if (path.endsWith("Cargo.toml")) return extractTomlSectionKeys(raw, ["dependencies", "dev-dependencies", "build-dependencies"]).slice(0, 40);
+  return [];
+}
+
+function extractFeatures(path: string, raw: string) {
+  if (path.endsWith("Cargo.toml")) return extractTomlSectionKeys(raw, ["features"]).slice(0, 40);
+  return [];
+}
+
+function extractConfigKeys(path: string, lines: string[]) {
+  const lower = path.toLowerCase();
+  if (!/\.(ya?ml|toml|json|env|template)$/.test(lower) && !lower.includes("config")) return [];
+  return lines
+    .map((line) => line.match(/^\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*(?:=|:)/)?.[1]?.trim())
+    .filter((value): value is string => Boolean(value))
+    .slice(0, 32);
+}
+
+function extractRoutes(lines: string[]) {
+  return lines
+    .map((line) => {
+      const fastify = line.match(/\b(?:app|server|router)\.(get|post|patch|put|delete)\(\s*["'`]([^"'`]+)["'`]/i);
+      if (fastify?.[1] && fastify[2]) return `${fastify[1].toUpperCase()} ${fastify[2]}`;
+      const express = line.match(/\broute\(\s*["'`]([^"'`]+)["'`]/i);
+      return express?.[1] ? `ROUTE ${express[1]}` : null;
+    })
+    .filter((value): value is string => Boolean(value))
+    .slice(0, 32);
+}
+
+function extractTestTargets(path: string, lines: string[]) {
+  if (!/test|spec|hil-test|qa-test|compile-tests/i.test(path)) return [];
+  return lines
+    .map((line) => line.match(/\b(?:describe|it|test)\(\s*["'`]([^"'`]+)["'`]/)?.[1]?.trim())
+    .filter((value): value is string => Boolean(value))
+    .slice(0, 24);
+}
+
+function parseJsonObject(raw: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractTomlSectionKeys(raw: string, sectionNames: string[]) {
+  const keys: string[] = [];
+  let active = "";
+  for (const line of raw.split(/\r?\n/)) {
+    const section = line.match(/^\s*\[([^\]]+)\]\s*$/)?.[1]?.trim();
+    if (section) {
+      active = section;
+      continue;
+    }
+    if (!sectionNames.includes(active)) continue;
+    const key = line.match(/^\s*([A-Za-z0-9_-]+)\s*=/)?.[1];
+    if (key) keys.push(key);
+  }
+  return keys;
 }
 
 function extractCargoPackageName(raw: string) {
