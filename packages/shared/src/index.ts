@@ -236,7 +236,7 @@ const baseChapters: BookChapter[] = [
     progress: 100,
     status: "complete",
     estimatedMinutes: 14,
-    files: ["README.md", "package.json", "web-mockup/index.html"],
+    files: ["README.md", "package.json", "apps/web/src/App.tsx"],
     goals: [
       "저장소가 어떤 문제를 푸는지 한 문장으로 요약한다.",
       "실행 스크립트와 첫 화면을 연결한다."
@@ -249,11 +249,11 @@ const baseChapters: BookChapter[] = [
       }
     ],
     code: {
-      path: "web-mockup/index.html",
+      path: "apps/web/src/App.tsx",
       label: "첫 화면 셸",
-      lines: ["<main class=\"workspace\" id=\"workspace\">", "  <section class=\"mock-view library-view\" data-view=\"library\">"]
+      lines: ["<main className=\"workspace\" id=\"workspace\">", "  <div className=\"app-view\">{children}</div>"]
     },
-    notes: [{ title: "LM Studio 판정", body: "제품 목업 중심이므로 화면 상태를 먼저 읽는 흐름이 적합합니다." }],
+    notes: [{ title: "LM Studio 판정", body: "실행 가능한 앱 구조이므로 라우팅과 화면 상태를 먼저 읽는 흐름이 적합합니다." }],
     checkpoints: ["첫 실행 경로 확인", "주요 화면 이름 추출", "책의 독자 수준 확정"]
   },
   {
@@ -267,7 +267,7 @@ const baseChapters: BookChapter[] = [
     progress: 62,
     status: "current",
     estimatedMinutes: 21,
-    files: ["docs/requirements", "docs/design", "web-mockup"],
+    files: ["docs/requirements", "docs/design", "apps/web/src"],
     goals: [
       "폴더 이름을 학습 목적 단위로 번역한다.",
       "읽기 순서와 실제 파일 위치를 분리해서 설명한다."
@@ -285,9 +285,9 @@ const baseChapters: BookChapter[] = [
       }
     ],
     code: {
-      path: "web-mockup/data.js",
+      path: "packages/shared/src/index.ts",
       label: "목차 fixture",
-      lines: ["const bookChapters = [", "  { part: \"Part I. 저장소 지도\", number: \"1.2\" }", "];"]
+      lines: ["const baseChapters: BookChapter[] = [", "  { number: \"1.2\", title: \"폴더를 대단원으로 바꾸기\" }", "];"]
     },
     notes: [{ title: "왜 중요한가", body: "목차가 파일 트리와 같으면 책이 아니라 탐색기입니다." }],
     checkpoints: ["폴더 책임 요약", "대단원 이름 확정", "챕터별 읽을 파일 제한"]
@@ -303,7 +303,7 @@ const baseChapters: BookChapter[] = [
     progress: 18,
     status: "next",
     estimatedMinutes: 18,
-    files: ["web-mockup/index.html", "web-mockup/styles.css"],
+    files: ["apps/web/src/App.tsx", "apps/web/src/styles.css"],
     goals: ["책장, 생성 중, 이어 읽기 영역을 구분한다.", "책 표지에 저장소와 현재 챕터 정보를 함께 담는다."],
     sections: [
       {
@@ -313,7 +313,7 @@ const baseChapters: BookChapter[] = [
       }
     ],
     code: {
-      path: "web-mockup/styles.css",
+      path: "apps/web/src/styles.css",
       label: "책장 레이아웃",
       lines: [".shelf-row {", "  display: grid;", "  gap: 14px;", "}"]
     },
@@ -336,7 +336,7 @@ const makeBook = (overrides: Partial<RepoBook>): RepoBook => {
   return repoBookSchema.parse({
     id: bookId,
     title: "Repo Books를 읽는 책",
-    subtitle: "저장소 목업을 기술서처럼 읽고, 화면에서 코드까지 이어가는 학습서",
+    subtitle: "저장소 앱을 기술서처럼 읽고, 화면에서 코드까지 이어가는 학습서",
     repo: "suyoungkim/repo-books",
     branch: "main",
     model: "LM Studio · qwen3-coder",

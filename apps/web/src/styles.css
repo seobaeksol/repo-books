@@ -376,7 +376,7 @@ svg {
   outline: none;
 }
 
-.mock-view {
+.app-view {
   display: grid;
   align-content: start;
   gap: 18px;

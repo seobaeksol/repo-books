@@ -7,7 +7,7 @@ import { App } from "../App";
 const book = {
   id: "repo-books-book",
   title: "Repo Books를 읽는 책",
-  subtitle: "저장소 목업을 기술서처럼 읽는 학습서",
+  subtitle: "저장소 앱을 기술서처럼 읽는 학습서",
   repo: "suyoungkim/repo-books",
   branch: "main",
   model: "LM Studio · qwen3-coder",
@@ -48,7 +48,7 @@ const book = {
       goals: ["폴더 책임을 요약한다."],
       sections: [{ eyebrow: "흐름", title: "파일 트리는 지도다", body: "목차는 독자의 여행 일정입니다." }],
       files: ["docs/requirements"],
-      code: { path: "web-mockup/data.js", label: "목차 fixture", lines: ["const bookChapters = [];"] },
+      code: { path: "packages/shared/src/index.ts", label: "목차 fixture", lines: ["const baseChapters = [];"] },
       notes: [],
       checkpoints: ["대단원 이름 확정"],
       estimatedMinutes: 21,

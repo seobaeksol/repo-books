@@ -1,6 +1,6 @@
 # Repo Books 요구사항 문서
 
-이 디렉토리는 GitHub 저장소를 한 권의 기술서처럼 변환해 읽는 Repo Books 웹앱의 요구사항을 정리한다. 현재 제품 기준은 `web-mockup`의 Apple Books형 책장, 목차 생성, 읽기 화면이다.
+이 디렉토리는 GitHub 저장소를 한 권의 기술서처럼 변환해 읽는 Repo Books 웹앱의 요구사항을 정리한다. 현재 구현 기준은 `apps/web`의 React 앱과 `apps/api`의 로컬 API 서버이며, 이전 정적 목업은 보관 대상에서 제외했다.
 
 ## 문서 구조
 

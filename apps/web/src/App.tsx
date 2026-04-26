@@ -436,7 +436,7 @@ function AppFrame({
       </header>
 
       <main className="workspace" id="workspace" tabIndex={-1}>
-        <div className="mock-view">{children}</div>
+        <div className="app-view">{children}</div>
       </main>
 
       <nav className="mobile-library-nav command-surface" aria-label="모바일 책장 탐색">
