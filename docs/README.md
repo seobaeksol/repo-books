@@ -19,4 +19,4 @@
 
 ## MVP 상태
 
-현재 구현은 로컬 실행 가능한 MVP 기반이다. LM Studio 호출과 저장소 분석은 아직 mock adapter이며, API와 web state 구조는 실제 구현으로 교체할 수 있게 분리되어 있다.
+현재 구현은 로컬 실행 가능한 MVP 기반이다. 저장소 분석은 로컬 API의 deterministic scanner와 `esp-hal` 튜닝 profile로 수행하며, LM Studio 추론 호출은 아직 연결하지 않았다.

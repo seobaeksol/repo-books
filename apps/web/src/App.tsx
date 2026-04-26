@@ -28,7 +28,7 @@ import {
 import type { CSSProperties, FormEvent, RefObject } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
-import type { BookChapter, BookFilter, ReadingState, UIState } from "@repo-books/shared";
+import type { BookChapter, BookFilter, GenerationStep, ReadingState, UIState } from "@repo-books/shared";
 import { api, BookWithContent, GenerationResult, TutorThreadWithMessages } from "./lib/api";
 import {
   colorInputValue,
@@ -85,7 +85,7 @@ const GENERATION_STEPS: Array<{ id: string; label: string; detail: string }> = [
 ];
 
 const GENERATION_FORM_DEFAULT = {
-  repositoryUrl: "https://github.com/suyoungkim/repo-books",
+  repositoryUrl: "https://github.com/esp-rs/esp-hal",
   model: "qwen3-coder 14B",
   audience: "유지보수 가능한 junior developer",
   depth: "balanced"
@@ -769,6 +769,7 @@ function GenerationView({
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const displayBook = result?.book ?? activeBook;
+  const canReadBook = Boolean(displayBook) && !running;
 
   async function runGenerate(event?: FormEvent) {
     event?.preventDefault();
@@ -786,6 +787,13 @@ function GenerationView({
   }
 
   const runPhase = result ? generationRunPhase(result.run.status) : running ? "toc" : "scan";
+  const displaySteps: GenerationStep[] =
+    result?.run.steps ??
+    GENERATION_STEPS.map((step) => ({
+      label: step.label,
+      detail: step.detail,
+      state: generationStepState(step.id, runPhase, running || Boolean(result))
+    }));
 
   return (
     <section className="generation-view" aria-labelledby="generation-title">
@@ -802,7 +810,7 @@ function GenerationView({
           className="primary-action"
           type="button"
           onClick={() => displayBook && onReadBook(displayBook.id, displayBook.currentChapterId ?? firstChapter(displayBook)?.id)}
-          disabled={!displayBook}
+          disabled={!canReadBook}
         >
           <BookOpenCheck />
           <span>읽기 시작</span>
@@ -818,10 +826,10 @@ function GenerationView({
           </div>
           <h1 id="generation-title">기술서 목차 생성</h1>
           <form className="repo-form" onSubmit={runGenerate}>
-            <label htmlFor="generation-repo">Repository URL</label>
+            <label htmlFor="generation-repo">Repository URL or local path</label>
             <input
               id="generation-repo"
-              type="url"
+              type="text"
               value={form.repositoryUrl}
               onChange={(event) => setForm({ ...form, repositoryUrl: event.target.value })}
               required
@@ -853,7 +861,7 @@ function GenerationView({
                 className="secondary-action"
                 type="button"
                 onClick={() => displayBook && onReadBook(displayBook.id, displayBook.currentChapterId ?? firstChapter(displayBook)?.id)}
-                disabled={!displayBook}
+                disabled={!canReadBook}
               >
                 <BookOpenCheck />
                 <span>읽기 시작</span>
@@ -871,7 +879,7 @@ function GenerationView({
             </div>
             <span className="outline-confidence">
               <span className="state-dot state-dot--ready" />
-              mock coherent
+              indexed coherent
             </span>
           </div>
           <OutlinePreview book={displayBook} onReadBook={onReadBook} />
@@ -880,13 +888,13 @@ function GenerationView({
         <aside className="runtime-panel panel-surface" aria-labelledby="runtime-title">
           <div className="section-title" id="runtime-title">
             <Activity />
-            <span>LM Studio run</span>
+            <span>Generation run</span>
           </div>
           <div className="step-list">
-            {GENERATION_STEPS.map((step) => {
-              const state = generationStepState(step.id, runPhase, running || Boolean(result));
+            {displaySteps.map((step, index) => {
+              const state = step.state;
               return (
-                <div key={step.id} className={`step-item is-${state}`}>
+                <div key={`${step.label}-${index}`} className={`step-item is-${state}`}>
                   <span className="step-marker">{stepIcon(state)}</span>
                   <div>
                     <strong>{step.label}</strong>
@@ -899,11 +907,11 @@ function GenerationView({
           <dl className="metric-list">
             <div>
               <dt>Context</dt>
-              <dd>128k</dd>
+              <dd>{result?.run.context ?? (form.depth === "deep" ? "128k" : "64k")}</dd>
             </div>
             <div>
-              <dt>Storage</dt>
-              <dd>SQLite</dd>
+              <dt>Branch</dt>
+              <dd>{result?.run.branch ?? "main"}</dd>
             </div>
             <div>
               <dt>Output</dt>
@@ -1599,7 +1607,7 @@ function firstCodeAnchor(chapter: BookChapter) {
   return {
     path: fromAnchors?.path ?? fromLegacy?.path ?? relatedFiles(chapter)[0] ?? "README.md",
     label: fromAnchors?.label ?? fromLegacy?.label ?? "코드 근거",
-    lines: fromAnchors?.lines ?? fromLegacy?.lines ?? ["// Mock adapter가 실제 저장소 분석으로 교체될 지점입니다."]
+    lines: fromAnchors?.lines ?? fromLegacy?.lines ?? ["// 저장소 색인 결과에서 코드 근거를 추출하는 중입니다."]
   };
 }
 

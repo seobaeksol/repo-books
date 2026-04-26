@@ -18,9 +18,11 @@ import {
   type TutorThread,
   type UIState,
   seedBooks,
-  seedGenerationOutline,
   seedUiState
 } from "@repo-books/shared";
+import { buildRepoIndex } from "./generation/indexer.js";
+import { generationSteps, synthesizeRepoBook } from "./generation/synthesizer.js";
+import { materializeRepository } from "./generation/source.js";
 
 type SqliteDatabase = Database.Database;
 type Row = Record<string, unknown>;
@@ -284,23 +286,20 @@ export const createRepository = (db: SqliteDatabase) => {
 
   const createGenerationRun = (payload: PostGenerationOutlinePayload): { generationRun: GenerationRun; book: RepoBook } => {
     const timestamp = nowIso();
-    const book = createGeneratedBook(payload, timestamp);
+    const source = materializeRepository(payload.repoUrl, payload.branch);
+    const index = buildRepoIndex(source);
+    const { book, outline } = synthesizeRepoBook(payload, index);
     const run: GenerationRun = {
       id: randomUUID(),
       bookId: book.id,
       repoUrl: payload.repoUrl,
-      branch: payload.branch,
+      branch: index.branch,
       model: payload.model,
       context: payload.context,
-      status: "running",
-      progress: 68,
-      steps: [
-        { label: "GitHub URL 검증", state: "complete", detail: `${payload.branch} branch` },
-        { label: "파일 트리 색인", state: "complete", detail: "mock repository index ready" },
-        { label: "대단원 초안", state: "active", detail: "기술서 흐름으로 재배열" },
-        { label: "챕터별 코드 근거", state: "pending", detail: "file anchor extraction queued" }
-      ],
-      outline: seedGenerationOutline,
+      status: "complete",
+      progress: 100,
+      steps: generationSteps(index),
+      outline,
       createdAt: timestamp,
       updatedAt: timestamp
     };
@@ -366,8 +365,8 @@ export const createRepository = (db: SqliteDatabase) => {
         id: randomUUID(),
         threadId,
         role: "assistant",
-        body: "이 장에서는 먼저 목차의 책임을 확인하고, 관련 파일을 작은 묶음으로 읽는 것이 좋습니다.",
-        metadata: { mock: true },
+        body: buildTutorReply(thread, payload.body),
+        metadata: { generated: "contextual" },
         createdAt: nowIso()
       });
     }
@@ -461,59 +460,24 @@ export const createRepository = (db: SqliteDatabase) => {
     return mapTutorThread(row, listTutorMessages(threadId));
   }
 
-  function createGeneratedBook(payload: PostGenerationOutlinePayload, timestamp: string): RepoBook {
-    const source = seedBooks[0];
-    const repoName = repositoryNameFromUrl(payload.repoUrl);
-    const bookId = `generated-${slugify(repoName)}-${Date.now()}`;
-    const parts = source.parts.map((part, index) => ({
-      ...part,
-      id: `${bookId}-part-${index + 1}`,
-      bookId
-    }));
-    const partIdsByOrder = new Map(parts.map((part) => [part.order, part.id]));
-    const chapters = source.chapters.map((chapter) => ({
-      ...chapter,
-      id: `${bookId}-chapter-${chapter.number.replaceAll(".", "-")}`,
-      bookId,
-      partId: partIdsByOrder.get(chapter.order < 2 ? 0 : chapter.order < 3 ? 1 : 2) ?? parts[0].id,
-      progress: chapter.order === 0 ? 8 : 0,
-      status: chapter.order === 0 ? ("current" as const) : ("draft" as const)
-    }));
+  function buildTutorReply(thread: Row, question: string) {
+    const book = getBook(asString(thread.book_id));
+    const chapter = book?.chapters.find((item) => item.id === asString(thread.chapter_id));
+    if (!book || !chapter) return "이 장에서는 먼저 관련 파일을 2-3개로 좁히고, 목표와 체크포인트를 기준으로 읽는 것이 좋습니다.";
 
-    return {
-      ...source,
-      id: bookId,
-      title: `${repoName}를 읽는 책`,
-      subtitle: `${payload.audience}를 위한 ${payload.depth} 깊이의 mock repo book 초안`,
-      repo: repoName,
-      branch: payload.branch,
-      model: `LM Studio · ${payload.model}`,
-      updated: "방금 전",
-      status: "draft",
-      statusLabel: "초안",
-      accent: "cyan",
-      progress: 8,
-      currentChapterId: chapters[0]?.id ?? "",
-      parts,
-      chapters
-    };
+    const files = chapter.files.slice(0, 3).join(", ");
+    const checkpoint = chapter.checkpoints[0] ?? "핵심 API 경계를 표시";
+    const firstGoal = chapter.goals[0] ?? "이 장의 책임을 요약";
+    const trimmedQuestion = question.trim().slice(0, 120);
+    return [
+      `질문을 ${chapter.title} 맥락으로 보면, 먼저 ${files || "챕터의 근거 파일"}을 열고 ${firstGoal}하는 흐름이 좋습니다.`,
+      `특히 ${checkpoint}를 확인하면 다음 장으로 넘어갈 기준이 생깁니다.`,
+      trimmedQuestion ? `질문 "${trimmedQuestion}"에 대한 답은 본문 전체보다 이 체크포인트를 통과했는지로 좁혀서 판단하세요.` : ""
+    ]
+      .filter(Boolean)
+      .join(" ");
   }
 };
-
-const repositoryNameFromUrl = (value: string) => {
-  const trimmed = value.trim().replace(/\/$/, "");
-  const githubMatch = trimmed.match(/github\.com[:/](.+?)(?:\.git)?$/);
-  if (githubMatch?.[1]) return githubMatch[1];
-  const parts = trimmed.split("/").filter(Boolean);
-  return parts.slice(-2).join("/") || "local/repository";
-};
-
-const slugify = (value: string) =>
-  value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 48) || "repo";
 
 const insertTutorMessage = (db: SqliteDatabase, message: TutorMessage) => {
   db.prepare(
