@@ -29,7 +29,23 @@ import {
 import type { CSSProperties, FormEvent, RefObject } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
-import type { BookChapter, BookFilter, GenerationStep, ReadingState, UIState } from "@repo-books/shared";
+import {
+  BOOK_PURPOSE_OPTIONS,
+  DEFAULT_BOOK_PURPOSE,
+  DEFAULT_GENERATION_DEPTH,
+  DEFAULT_GENERATION_MODEL,
+  DEFAULT_READER_LEVEL,
+  GENERATION_DEPTH_OPTIONS,
+  GENERATION_MODEL_OPTIONS,
+  READER_LEVEL_OPTIONS,
+  type BookChapter,
+  type BookFilter,
+  type GenerationArtifact,
+  type GenerationStep,
+  type LmStudioModelOption,
+  type ReadingState,
+  type UIState
+} from "@repo-books/shared";
 import { api, BookWithContent, GenerationResult, TutorThreadWithMessages } from "./lib/api";
 import {
   colorInputValue,
@@ -50,6 +66,15 @@ import {
 type MobilePanel = "" | "toc" | "mentor";
 type StudioStatus = "ready" | "offline" | "error";
 type RunStepState = "pending" | "active" | "complete" | "failed";
+type GenerationForm = {
+  repositoryUrl: string;
+  model: string;
+  audience: string;
+  readerLevel: string;
+  bookPurpose: string;
+  depth: string;
+  customPrompt: string;
+};
 type PersistedPatch = Partial<UIState> & {
   lastRoute?: string;
   selectedLibraryFilter?: BookFilter;
@@ -79,6 +104,7 @@ const STATUS_LABELS: Record<string, string> = {
 };
 
 const GENERATION_STEPS: Array<{ id: string; label: string; detail: string }> = [
+  { id: "model", label: "모델 준비", detail: "LM Studio 모델 확인과 필요 시 로컬 다운로드" },
   { id: "analysis", label: "저장소 분석", detail: "색인, entrypoint, repo archetype 추출" },
   { id: "part", label: "대단원 설계", detail: "저장소 전체 arc와 대단원 목적 구성" },
   { id: "chapter", label: "소단원 설계", detail: "대단원별 핵심 질문과 선후 관계 구성" },
@@ -88,11 +114,14 @@ const GENERATION_STEPS: Array<{ id: string; label: string; detail: string }> = [
   { id: "coherence", label: "책 일관성 점검", detail: "용어, recap, 다음 장 연결 확인" }
 ];
 
-const GENERATION_FORM_DEFAULT = {
-  repositoryUrl: "https://github.com/esp-rs/esp-hal",
-  model: "qwen3-coder 14B",
-  audience: "유지보수 가능한 junior developer",
-  depth: "balanced"
+const GENERATION_FORM_DEFAULT: GenerationForm = {
+  repositoryUrl: "",
+  model: DEFAULT_GENERATION_MODEL,
+  audience: DEFAULT_READER_LEVEL,
+  readerLevel: DEFAULT_READER_LEVEL,
+  bookPurpose: DEFAULT_BOOK_PURPOSE,
+  depth: DEFAULT_GENERATION_DEPTH,
+  customPrompt: ""
 };
 
 const FOCUSABLE_SELECTOR = [
@@ -270,6 +299,22 @@ export function App() {
     void openBook(targetBook.id);
   }
 
+  const rememberGenerationResult = useCallback((result: GenerationResult) => {
+    const generatedBook = result.book;
+    if (!generatedBook) return;
+    setActiveBook(generatedBook);
+    setBooks((current) => upsertBook(current, generatedBook));
+  }, []);
+
+  function openLibraryBook(book: BookWithContent) {
+    if (book.status === "generating" && book.generationRunId) {
+      setActiveBook(book);
+      navigate(`/generation/runs/${book.generationRunId}`);
+      return;
+    }
+    void openBook(book.id);
+  }
+
   function updateTheme(nextThemeId: ThemeId) {
     setThemeId(nextThemeId);
     saveUIState({ themeId: nextThemeId });
@@ -328,7 +373,7 @@ export function App() {
               activeBookId={activeBook?.id}
               filter={bookFilter}
               onFilterChange={selectFilter}
-              onOpenBook={(bookId) => void openBook(bookId)}
+              onOpenBook={openLibraryBook}
               onCreateBook={goToGeneration}
             />
           }
@@ -340,12 +385,17 @@ export function App() {
               activeBook={activeBook}
               onBack={goToLibrary}
               onReadBook={(bookId, chapterId) => void openBook(bookId, chapterId)}
-              onGenerated={(result) => {
-                const generatedBook = result.book;
-                if (!generatedBook) return;
-                setActiveBook(generatedBook);
-                setBooks((current) => upsertBook(current, generatedBook));
-              }}
+              onGenerated={rememberGenerationResult}
+            />
+          }
+        />
+        <Route
+          path="/generation/runs/:runId"
+          element={
+            <GenerationProgressRoute
+              onBack={goToLibrary}
+              onReadBook={(bookId, chapterId) => void openBook(bookId, chapterId)}
+              onGenerated={rememberGenerationResult}
             />
           }
         />
@@ -598,7 +648,7 @@ function LibraryView({
   activeBookId?: string;
   filter: BookFilter;
   onFilterChange: (filter: BookFilter) => Promise<void>;
-  onOpenBook: (bookId: string) => void;
+  onOpenBook: (book: BookWithContent) => void;
   onCreateBook: () => void;
 }) {
   const recentBooks = [...books]
@@ -710,11 +760,12 @@ function SidebarButton({
   );
 }
 
-function RecentBook({ book, onOpenBook }: { book: BookWithContent; onOpenBook: (bookId: string) => void }) {
+function RecentBook({ book, onOpenBook }: { book: BookWithContent; onOpenBook: (book: BookWithContent) => void }) {
   const chapter = currentChapter(book);
+  const actionLabel = book.status === "generating" ? `${book.title} 진행상황 보기` : `${book.title} 읽기`;
   return (
     <article className={`recent-book book-accent-${coverTheme(book)}`}>
-      <button className="book-cover" type="button" onClick={() => onOpenBook(book.id)} aria-label={`${book.title} 읽기`}>
+      <button className="book-cover" type="button" onClick={() => onOpenBook(book)} aria-label={actionLabel}>
         <span className="book-status">{statusLabel(book)}</span>
         <strong>{book.title}</strong>
         <small>{repositoryName(book)}</small>
@@ -724,7 +775,7 @@ function RecentBook({ book, onOpenBook }: { book: BookWithContent; onOpenBook: (
           {formatUpdated(book)} · {modelName(book)}
         </span>
         <h3>
-          {chapter?.number} {chapter?.title}
+          {chapter ? `${chapter.number} ${chapter.title}` : statusLabel(book)}
         </h3>
         <ProgressBar value={progress(book)} />
       </div>
@@ -739,16 +790,17 @@ function BookCard({
 }: {
   book: BookWithContent;
   selected: boolean;
-  onOpenBook: (bookId: string) => void;
+  onOpenBook: (book: BookWithContent) => void;
 }) {
+  const actionLabel = book.status === "generating" ? `${book.title} 진행상황 보기` : `${book.title} 읽기`;
   return (
     <article className={`book-card book-accent-${coverTheme(book)} ${selected ? "is-selected" : ""}`}>
-      <button className="book-cover-tile" type="button" onClick={() => onOpenBook(book.id)} aria-label={`${book.title} 읽기`}>
+      <button className="book-cover-tile" type="button" onClick={() => onOpenBook(book)} aria-label={actionLabel}>
         <span>{statusLabel(book)}</span>
         <strong>{book.title}</strong>
       </button>
       <div className="book-card-body">
-        <button className="book-title-button" type="button" onClick={() => onOpenBook(book.id)}>
+        <button className="book-title-button" type="button" onClick={() => onOpenBook(book)}>
           {book.title}
         </button>
         <small>{repositoryName(book)}</small>
@@ -770,55 +822,70 @@ function GenerationView({
   onReadBook: (bookId: string, chapterId?: string) => void;
   onGenerated: (result: GenerationResult) => void;
 }) {
+  const navigate = useNavigate();
   const [form, setForm] = useState(GENERATION_FORM_DEFAULT);
-  const [result, setResult] = useState<GenerationResult | null>(null);
   const [running, setRunning] = useState(false);
-  const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const displayBook = result?.book ?? activeBook;
-  const canReadBook = Boolean(displayBook) && !running;
-  const failedChapterCount = result?.run.chapterRuns?.filter((chapter) => chapter.status === "failed").length ?? 0;
-  const canRetryFailedChapters = Boolean(result?.run.id) && failedChapterCount > 0 && !running && !retrying;
+  const [lmStudioModels, setLmStudioModels] = useState<LmStudioModelOption[]>([]);
+  const [lmStudioModelsLoading, setLmStudioModelsLoading] = useState(false);
+  const [lmStudioModelError, setLmStudioModelError] = useState<string | null>(null);
+  const modelEditedRef = useRef(false);
+  const displayBook = activeBook;
+  const canReadBook = Boolean(displayBook?.chapters?.length) && !running;
+  const selectedLmStudioModel = lmStudioModels.find((option) => option.modelKey === form.model);
+  const selectedPresetModel = GENERATION_MODEL_OPTIONS.find((option) => option.value === form.model);
+  const modelOptions = lmStudioModels.length
+    ? lmStudioModels.map((option) => ({ value: option.modelKey, label: lmStudioModelLabel(option) }))
+    : GENERATION_MODEL_OPTIONS;
+  const modelDescription = lmStudioModelsLoading
+    ? "로컬 LM Studio 모델 목록을 확인하는 중입니다."
+    : selectedLmStudioModel
+      ? lmStudioModelDescription(selectedLmStudioModel)
+      : lmStudioModelError && !lmStudioModels.length
+        ? `로컬 모델 목록을 불러오지 못해 직접 입력할 수 있습니다. ${lmStudioModelError}`
+        : selectedPresetModel?.description ?? "LM Studio에 등록된 모델 ID를 직접 입력할 수 있습니다.";
+  const selectedReaderLevel = READER_LEVEL_OPTIONS.find((option) => option.value === form.readerLevel) ?? READER_LEVEL_OPTIONS[0];
+  const selectedBookPurpose = BOOK_PURPOSE_OPTIONS.find((option) => option.value === form.bookPurpose) ?? BOOK_PURPOSE_OPTIONS[0];
+  const selectedDepth = GENERATION_DEPTH_OPTIONS.find((option) => option.value === form.depth) ?? GENERATION_DEPTH_OPTIONS[1];
+
+  const loadLmStudioModels = useCallback(async (refresh = false) => {
+    setLmStudioModelsLoading(true);
+    try {
+      const response = await api.listLmStudioModels(refresh);
+      setLmStudioModels(response.models);
+      setLmStudioModelError(response.error ?? null);
+      if (response.models.length) {
+        setForm((current) => {
+          if (modelEditedRef.current || response.models.some((model) => model.modelKey === current.model)) return current;
+          return { ...current, model: response.models[0].modelKey };
+        });
+      }
+    } catch (reason) {
+      setLmStudioModelError(reason instanceof Error ? reason.message : "로컬 모델 목록을 불러오지 못했습니다.");
+    } finally {
+      setLmStudioModelsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadLmStudioModels(false);
+  }, [loadLmStudioModels]);
 
   async function runGenerate(event?: FormEvent) {
     event?.preventDefault();
+    const nextForm = { ...form };
     setRunning(true);
-    setResult(null);
     setError(null);
     try {
-      const nextResult = await api.generateOutline(form, setResult);
-      setResult(nextResult);
+      const nextResult = await api.startGenerationRun(nextForm);
       if (nextResult.book) onGenerated(nextResult);
+      navigate(`/generation/runs/${nextResult.run.id}`);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "목차 생성에 실패했습니다.");
+      setError(reason instanceof Error ? reason.message : "책 생성에 실패했습니다.");
     } finally {
       setRunning(false);
     }
   }
-
-  async function retryFailedChapters() {
-    if (!result?.run.id) return;
-    setRetrying(true);
-    setError(null);
-    try {
-      const nextResult = await api.retryFailedGenerationChapters(result.run.id);
-      setResult(nextResult);
-      if (nextResult.book) onGenerated(nextResult);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "실패한 챕터 재시도에 실패했습니다.");
-    } finally {
-      setRetrying(false);
-    }
-  }
-
-  const runPhase = result ? generationRunPhase(result.run.status) : running ? "part" : "analysis";
-  const displaySteps: GenerationStep[] =
-    result?.run.steps ??
-    GENERATION_STEPS.map((step) => ({
-      label: step.label,
-      detail: step.detail,
-      state: generationStepState(step.id, runPhase, running || Boolean(result))
-    }));
 
   return (
     <section className="generation-view" aria-labelledby="generation-title">
@@ -850,41 +917,98 @@ function GenerationView({
             <span>{running ? "generating" : "drafting"}</span>
           </div>
           <h1 id="generation-title">기술서 목차 생성</h1>
+          <p className="builder-summary">저장소를 책처럼 읽을 수 있도록 목차와 챕터 흐름을 만듭니다.</p>
           <form className="repo-form" onSubmit={runGenerate}>
-            <label htmlFor="generation-repo">Repository URL or local path</label>
-            <input
-              id="generation-repo"
-              type="text"
-              value={form.repositoryUrl}
-              onChange={(event) => setForm({ ...form, repositoryUrl: event.target.value })}
-              required
-            />
-            <label htmlFor="model-select">LM Studio model</label>
-            <select id="model-select" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })}>
-              <option>qwen3-coder 14B</option>
-              <option>llama-3.1-8b</option>
-              <option>mistral-nemo</option>
-            </select>
-            <label htmlFor="reader-level">Reader level</label>
-            <select id="reader-level" value={form.audience} onChange={(event) => setForm({ ...form, audience: event.target.value })}>
-              <option>유지보수 가능한 junior developer</option>
-              <option>처음 보는 저장소를 읽는 designer-engineer</option>
-              <option>리팩터링을 준비하는 maintainer</option>
-            </select>
-            <label htmlFor="generation-depth">Generation depth</label>
-            <select id="generation-depth" value={form.depth} onChange={(event) => setForm({ ...form, depth: event.target.value })}>
-              <option value="light">light</option>
-              <option value="balanced">balanced</option>
-              <option value="deep">deep</option>
-            </select>
+            <div className="form-section">
+              <span className="form-section-title">저장소</span>
+              <label htmlFor="generation-repo">저장소 URL 또는 로컬 경로</label>
+              <input
+                id="generation-repo"
+                type="text"
+                value={form.repositoryUrl}
+                placeholder="https://github.com/owner/repo 또는 /local/path"
+                onChange={(event) => setForm({ ...form, repositoryUrl: event.target.value })}
+                required
+              />
+              <label htmlFor="model-select">LM Studio 모델</label>
+              <div className="model-input-row">
+                <input
+                  id="model-select"
+                  list="model-presets"
+                  type="text"
+                  value={form.model}
+                  aria-describedby="model-select-hint"
+                  onChange={(event) => {
+                    modelEditedRef.current = true;
+                    setForm({ ...form, model: event.target.value });
+                  }}
+                  required
+                />
+                <button
+                  className="model-refresh-button"
+                  type="button"
+                  aria-label="LM Studio 모델 목록 새로고침"
+                  title="LM Studio 모델 목록 새로고침"
+                  onClick={() => loadLmStudioModels(true)}
+                  disabled={lmStudioModelsLoading}
+                >
+                  {lmStudioModelsLoading ? <Loader2 className="spin" /> : <RefreshCcw />}
+                </button>
+              </div>
+              <datalist id="model-presets">
+                {modelOptions.map((option) => (
+                  <option key={option.value} value={option.value} label={option.label} />
+                ))}
+              </datalist>
+              <p className="field-hint" id="model-select-hint">{modelDescription}</p>
+            </div>
+            <div className="form-section">
+              <span className="form-section-title">책 설정</span>
+              <label htmlFor="reader-level">독자 수준</label>
+              <select
+                id="reader-level"
+                value={form.readerLevel}
+                aria-describedby="reader-level-hint"
+                onChange={(event) => {
+                  const readerLevel = event.target.value;
+                  setForm({ ...form, readerLevel, audience: readerLevel });
+                }}
+              >
+                {READER_LEVEL_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="field-hint" id="reader-level-hint">{selectedReaderLevel.description}</p>
+              <label htmlFor="book-purpose">책의 목적</label>
+              <select
+                id="book-purpose"
+                value={form.bookPurpose}
+                aria-describedby="book-purpose-hint"
+                onChange={(event) => setForm({ ...form, bookPurpose: event.target.value })}
+              >
+                {BOOK_PURPOSE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="field-hint" id="book-purpose-hint">{selectedBookPurpose.description}</p>
+              <label htmlFor="generation-depth">생성 깊이</label>
+              <select id="generation-depth" value={form.depth} aria-describedby="generation-depth-hint" onChange={(event) => setForm({ ...form, depth: event.target.value })}>
+                {GENERATION_DEPTH_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="field-hint" id="generation-depth-hint">{selectedDepth.description}</p>
+            </div>
             <div className="action-cluster">
               <button className="primary-action" type="submit" disabled={running}>
                 {running ? <Loader2 className="spin" /> : <Sparkles />}
-                <span>{running ? "생성 중" : "다시 생성"}</span>
-              </button>
-              <button className="secondary-action" type="button" onClick={retryFailedChapters} disabled={!canRetryFailedChapters}>
-                {retrying ? <Loader2 className="spin" /> : <RefreshCcw />}
-                <span>실패 챕터 재시도</span>
+                <span>{running ? "요청 중" : "책 생성"}</span>
               </button>
               <button
                 className="secondary-action"
@@ -914,11 +1038,157 @@ function GenerationView({
           <OutlinePreview book={displayBook} onReadBook={onReadBook} />
         </section>
 
-        <aside className="runtime-panel panel-surface" aria-labelledby="runtime-title">
-          <div className="section-title" id="runtime-title">
+        <aside className="prompt-panel panel-surface" aria-labelledby="custom-prompt-title">
+          <div className="section-title" id="custom-prompt-title">
+            <MessageSquareText />
+            <span>추가 요구</span>
+          </div>
+          <label htmlFor="custom-prompt">커스텀 프롬프트</label>
+          <textarea
+            id="custom-prompt"
+            className="custom-prompt-textarea"
+            value={form.customPrompt}
+            maxLength={4000}
+            aria-describedby="custom-prompt-hint"
+            placeholder="예: API 변경 지점을 먼저 다루고, 테스트 전략을 각 장의 체크포인트에 포함해줘."
+            onChange={(event) => setForm({ ...form, customPrompt: event.target.value })}
+          />
+          <p className="field-hint" id="custom-prompt-hint">
+            생성할 책에 추가로 반영할 요구를 적습니다. 저장소 근거와 선택한 책 설정 안에서 적용됩니다.
+          </p>
+          <dl className="metric-list">
+            <div>
+              <dt>Context</dt>
+              <dd>{form.depth === "deep" ? "128k" : "64k"}</dd>
+            </div>
+            <div>
+              <dt>Purpose</dt>
+              <dd>{selectedBookPurpose.label}</dd>
+            </div>
+            <div>
+              <dt>Reader</dt>
+              <dd>{selectedReaderLevel.label}</dd>
+            </div>
+          </dl>
+        </aside>
+      </div>
+    </section>
+  );
+}
+
+function GenerationProgressRoute({
+  onBack,
+  onReadBook,
+  onGenerated
+}: {
+  onBack: () => void;
+  onReadBook: (bookId: string, chapterId?: string) => void;
+  onGenerated: (result: GenerationResult) => void;
+}) {
+  const { runId = "" } = useParams();
+  const [result, setResult] = useState<GenerationResult | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [retrying, setRetrying] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [runtimeNow, setRuntimeNow] = useState(() => Date.now());
+  const displayBook = result?.book ?? null;
+  const running = result?.run.status === "queued" || result?.run.status === "running";
+  const failedChapterCount = result?.run.chapterRuns?.filter((chapter) => chapter.status === "failed").length ?? 0;
+  const canRetryFailedChapters = Boolean(result?.run.id) && failedChapterCount > 0 && !running && !retrying;
+  const canReadBook = Boolean(displayBook?.chapters?.length && result?.run.status === "complete" && !retrying);
+  const displaySteps: GenerationStep[] =
+    result?.run.steps ??
+    GENERATION_STEPS.map((step) => ({
+      label: step.label,
+      detail: step.detail,
+      state: generationStepState(step.id, "model", false)
+    }));
+
+  useEffect(() => {
+    if (!runId) return;
+    let cancelled = false;
+    let timer: number | undefined;
+
+    async function poll() {
+      try {
+        const nextResult = await api.getGenerationRun(runId);
+        if (cancelled) return;
+        setResult(nextResult);
+        setError(null);
+        if (nextResult.book) onGenerated(nextResult);
+        if (nextResult.run.status === "queued" || nextResult.run.status === "running") {
+          timer = window.setTimeout(poll, 500);
+        }
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : "생성 진행상황을 불러오지 못했습니다.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [runId, onGenerated]);
+
+  useEffect(() => {
+    if (!running && !retrying) return;
+    setRuntimeNow(Date.now());
+    const interval = window.setInterval(() => setRuntimeNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [running, retrying]);
+
+  useEffect(() => {
+    if (result) setRuntimeNow(Date.now());
+  }, [result?.run.updatedAt, result]);
+
+  async function retryFailedChapters() {
+    if (!result?.run.id) return;
+    setRetrying(true);
+    setRuntimeNow(Date.now());
+    setError(null);
+    try {
+      const nextResult = await api.retryFailedGenerationChapters(result.run.id);
+      setResult(nextResult);
+      if (nextResult.book) onGenerated(nextResult);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "실패한 챕터 재시도에 실패했습니다.");
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  return (
+    <section className="generation-view" aria-labelledby="generation-progress-title">
+      <div className="screen-toolbar command-surface" aria-label="생성 진행상황 화면 이동">
+        <button className="text-button" type="button" onClick={onBack}>
+          <ChevronLeft />
+          <span>책장으로 돌아가기</span>
+        </button>
+        <div className="toolbar-title">
+          <span className={`state-dot state-dot--${result?.run.status === "complete" ? "ready" : "draft"}`} />
+          <strong>생성 진행상황</strong>
+        </div>
+        <button
+          className="primary-action"
+          type="button"
+          onClick={() => displayBook && onReadBook(displayBook.id, displayBook.currentChapterId ?? firstChapter(displayBook)?.id)}
+          disabled={!canReadBook}
+        >
+          <BookOpenCheck />
+          <span>읽기 시작</span>
+        </button>
+      </div>
+
+      <div className="generation-progress-grid">
+        <aside className="runtime-panel panel-surface" aria-labelledby="generation-progress-title">
+          <div className="section-title" id="generation-progress-title">
             <Activity />
             <span>Generation run</span>
           </div>
+          <GenerationRunSummary result={result} running={loading || running || retrying} now={runtimeNow} error={error} />
           <div className="step-list">
             {displaySteps.map((step, index) => {
               const state = step.state;
@@ -933,14 +1203,7 @@ function GenerationView({
               );
             })}
           </div>
-          {result ? (
-            <div className="run-progress" aria-label="생성 진행률">
-              <span>{result.run.progress}%</span>
-              <div className="progress-track">
-                <span style={{ width: `${result.run.progress}%` }} />
-              </div>
-            </div>
-          ) : null}
+          <GenerationActivityLog result={result} />
           {result?.run.chapterRuns?.length ? (
             <div className="chapter-job-list" aria-label="챕터 생성 작업">
               <div className="chapter-job-list__header">
@@ -956,23 +1219,127 @@ function GenerationView({
               ))}
             </div>
           ) : null}
+          <div className="action-cluster">
+            <button className="secondary-action" type="button" onClick={retryFailedChapters} disabled={!canRetryFailedChapters}>
+              {retrying ? <Loader2 className="spin" /> : <RefreshCcw />}
+              <span>실패 챕터 재시도</span>
+            </button>
+          </div>
           <dl className="metric-list">
             <div>
               <dt>Context</dt>
-              <dd>{result?.run.context ?? (form.depth === "deep" ? "128k" : "64k")}</dd>
+              <dd>{result?.run.context ?? "64k"}</dd>
             </div>
             <div>
               <dt>Branch</dt>
               <dd>{result?.run.branch ?? "main"}</dd>
             </div>
             <div>
+              <dt>Model</dt>
+              <dd>{result?.run.model ?? "LM Studio"}</dd>
+            </div>
+            <div>
               <dt>Output</dt>
-              <dd>book draft</dd>
+              <dd>{result?.run.status === "complete" ? "book draft" : "generating book"}</dd>
             </div>
           </dl>
         </aside>
+
+        <section className="outline-panel" aria-labelledby="progress-outline-title">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Generated outline</p>
+              <h2 id="progress-outline-title">책의 목차</h2>
+            </div>
+            <span className="outline-confidence">
+              <span className="state-dot state-dot--ready" />
+              {result?.run.status === "complete" ? "indexed coherent" : generationStatusLabel(result?.run.status ?? "queued")}
+            </span>
+          </div>
+          <OutlinePreview book={displayBook} onReadBook={onReadBook} />
+        </section>
       </div>
     </section>
+  );
+}
+
+function GenerationRunSummary({
+  result,
+  running,
+  now,
+  error
+}: {
+  result: GenerationResult | null;
+  running: boolean;
+  now: number;
+  error: string | null;
+}) {
+  const run = result?.run;
+  const activeStep = run ? currentGenerationStep(run.steps) : null;
+  const progressValue = clampPercent(run?.progress ?? (running ? 2 : 0));
+  const elapsedMs = run ? elapsedMilliseconds(run.createdAt, now) : 0;
+  const updatedMs = run ? elapsedMilliseconds(run.updatedAt, now) : 0;
+  const waitingLong = Boolean(running && run && run.status === "running" && updatedMs >= 20_000);
+  const tone = generationStatusTone(run?.status, running, waitingLong, Boolean(error));
+  const title = generationStatusTitle(run?.status, running, waitingLong, Boolean(error));
+  const detail = error ?? activeStep?.detail ?? (running ? "서버에 생성 실행을 요청하는 중입니다." : "저장소와 모델을 입력하면 생성 실행이 시작됩니다.");
+
+  return (
+    <div className={`run-status-card is-${tone}`} role="status" aria-live="polite" aria-label="생성 상태 요약">
+      <div className="run-status-main">
+        <span className="run-status-icon">{generationStatusIcon(tone, running)}</span>
+        <div>
+          <strong>{title}</strong>
+          <small>{detail}</small>
+        </div>
+      </div>
+      <div className="run-progress" aria-label={`생성 진행률 ${progressValue}%`}>
+        <span>진행률 {progressValue}%</span>
+        <div className="progress-track">
+          <span style={{ width: `${progressValue}%` }} />
+        </div>
+      </div>
+      <div className="run-status-meta" aria-label="생성 실행 시간 정보">
+        <span>{run ? `경과 ${formatDuration(elapsedMs)}` : "경과 00:00"}</span>
+        <span>{run ? `마지막 갱신 ${formatDuration(updatedMs)} 전` : "아직 서버 갱신 없음"}</span>
+        <span>{run ? generationStatusLabel(run.status) : running ? "요청 중" : "대기"}</span>
+      </div>
+      {waitingLong ? (
+        <p className="run-status-warning">
+          현재 단계가 오래 실행 중입니다. 오류가 발생하면 실패 상태와 원인이 이 패널에 표시됩니다.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function GenerationActivityLog({ result }: { result: GenerationResult | null }) {
+  const activities = generationActivityItems(result?.run.artifacts ?? []);
+
+  if (!result) {
+    return <p className="runtime-hint">생성이 시작되면 단계별 산출물과 최근 활동이 여기에 표시됩니다.</p>;
+  }
+
+  if (!activities.length) {
+    return <p className="runtime-hint">현재 단계가 완료되면 저장소 분석, 목차 계획, 섹션 초안 같은 활동이 기록됩니다.</p>;
+  }
+
+  return (
+    <div className="activity-log" aria-label="최근 생성 활동">
+      <div className="activity-log__header">
+        <span>최근 생성 활동</span>
+        <strong>{result.run.artifacts.length} artifacts</strong>
+      </div>
+      <ol>
+        {activities.map((activity) => (
+          <li key={activity.id}>
+            <span className="activity-kind">{activity.kind}</span>
+            <span>{activity.title}</span>
+            <small>{activity.meta}</small>
+          </li>
+        ))}
+      </ol>
+    </div>
   );
 }
 
@@ -981,9 +1348,14 @@ function OutlinePreview({ book, onReadBook }: { book: BookWithContent | null; on
     return <div className="empty-state content-surface">아직 생성된 목차가 없습니다.</div>;
   }
 
+  const parts = partsForBook(book);
+  if (!parts.length) {
+    return <div className="empty-state content-surface">책 목차를 생성하는 중입니다.</div>;
+  }
+
   return (
     <div className="outline-preview">
-      {partsForBook(book).map((part) => {
+      {parts.map((part) => {
         const chapters = chaptersForPart(book, part.id);
         return (
           <article className="outline-part" key={part.id}>
@@ -1701,6 +2073,22 @@ function modelName(book: BookWithContent) {
   return getString(book, "lmStudioModel") || getString(book, "model") || "LM Studio";
 }
 
+function lmStudioModelLabel(model: LmStudioModelOption) {
+  const quantization = model.quantization?.name ? ` · ${model.quantization.name}` : "";
+  return `${model.displayName}${quantization}`;
+}
+
+function lmStudioModelDescription(model: LmStudioModelOption) {
+  const details = [
+    model.paramsString,
+    model.quantization?.name,
+    model.maxContextLength ? `${Math.round(model.maxContextLength / 1024)}k context` : "",
+    model.trainedForToolUse ? "tool use" : "",
+    model.vision ? "vision" : ""
+  ].filter(Boolean);
+  return `${model.modelKey}${details.length ? ` · ${details.join(" · ")}` : ""}`;
+}
+
 function formatUpdated(book: BookWithContent) {
   return getString(book, "updated") || (getString(book, "lastReadAt") ? "최근 읽음" : "방금 전");
 }
@@ -1803,12 +2191,120 @@ function mentorNotes(chapter: BookChapter) {
   ];
 }
 
+function currentGenerationStep(steps: GenerationStep[]) {
+  return steps.find((step) => step.state === "active" || step.state === "failed") ?? [...steps].reverse().find((step) => step.state === "complete") ?? steps[0] ?? null;
+}
+
+function generationStatusTone(status: string | undefined, running: boolean, waitingLong: boolean, hasError: boolean) {
+  if (hasError || status === "failed") return "failed";
+  if (status === "complete") return "complete";
+  if (waitingLong) return "waiting";
+  if (running || status === "running") return "running";
+  if (status === "queued") return "queued";
+  return "idle";
+}
+
+function generationStatusTitle(status: string | undefined, running: boolean, waitingLong: boolean, hasError: boolean) {
+  if (hasError || status === "failed") return "생성 실패";
+  if (status === "complete") return "생성 완료";
+  if (waitingLong) return "서버 응답 대기 중";
+  if (status === "queued") return "생성 대기 중";
+  if (running || status === "running") return "생성 진행 중";
+  return "생성 준비";
+}
+
+function generationStatusIcon(tone: string, running: boolean) {
+  if (tone === "complete") return <Check />;
+  if (tone === "failed") return <X />;
+  if (tone === "queued") return <Clock3 />;
+  if (tone === "running" || tone === "waiting" || running) return <Loader2 className="spin" />;
+  return <Circle />;
+}
+
+function generationStatusLabel(status: string) {
+  if (status === "queued") return "대기 중";
+  if (status === "running") return "실행 중";
+  if (status === "complete") return "완료";
+  if (status === "failed") return "실패";
+  return status;
+}
+
+function generationActivityItems(artifacts: GenerationArtifact[]) {
+  return [...artifacts]
+    .sort((a, b) => a.order - b.order)
+    .slice(-5)
+    .reverse()
+    .map((artifact) => {
+      const title = generationArtifactTitle(artifact);
+      const meta = [formatClockTime(artifact.createdAt), generationArtifactMeta(artifact)].filter(Boolean).join(" · ");
+      return {
+        id: artifact.id,
+        kind: generationArtifactKindLabel(artifact.kind),
+        title,
+        meta
+      };
+    });
+}
+
+function generationArtifactTitle(artifact: GenerationArtifact) {
+  const payload = artifact.payload;
+  const chapterNumber = getString(payload, "chapterNumber");
+  const title = getString(payload, "title") || getString(payload, "part") || generationArtifactKindLabel(artifact.kind);
+  const sectionIndex = getNumber(payload, "sectionIndex");
+  const section = artifact.kind === "section_draft" && sectionIndex !== undefined ? `section ${sectionIndex + 1}` : "";
+  return [chapterNumber, section, title].filter(Boolean).join(" · ");
+}
+
+function generationArtifactMeta(artifact: GenerationArtifact) {
+  const payload = artifact.payload;
+  const status = getString(payload, "status");
+  const source = getString(payload, "source");
+  const attempts = getNumber(payload, "attempts");
+  return [status, source, attempts ? `${attempts} attempts` : ""].filter(Boolean).join(" · ");
+}
+
+function generationArtifactKindLabel(kind: string) {
+  const labels: Record<string, string> = {
+    repository_analysis: "저장소 분석",
+    part_plan: "대단원 계획",
+    chapter_plan: "소단원 계획",
+    chapter_brief: "근거 수집",
+    section_plan: "섹션 계획",
+    section_draft: "섹션 초안",
+    chapter_revision: "챕터 수리",
+    book_coherence: "일관성 점검",
+    quality_issues: "품질 점검"
+  };
+  return labels[kind] ?? kind;
+}
+
+function elapsedMilliseconds(value: string, now: number) {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, now - parsed);
+}
+
+function formatDuration(milliseconds: number) {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatClockTime(value: string) {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return "";
+  return new Intl.DateTimeFormat("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(parsed);
+}
+
 function generationStepState(stepId: string, phase: string, hasRun: boolean): RunStepState {
-  const order = ["analysis", "part", "chapter", "brief", "draft", "repair", "coherence"];
+  const order = ["model", "analysis", "part", "chapter", "brief", "draft", "repair", "coherence"];
   const phaseIndex = order.indexOf(phase);
   const stepIndex = order.indexOf(stepId);
-  if (!hasRun && stepId !== "analysis") return "pending";
-  if (phase === "failed") return stepId === "analysis" ? "failed" : "pending";
+  if (!hasRun && stepId !== "model") return "pending";
+  if (phase === "failed") return stepId === "model" ? "failed" : "pending";
   if (stepIndex < phaseIndex || phase === "coherence") return "complete";
   if (stepIndex === phaseIndex) return "active";
   return "pending";

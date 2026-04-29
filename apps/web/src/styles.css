@@ -737,8 +737,16 @@ svg {
   align-items: start;
 }
 
+.generation-progress-grid {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.82fr) minmax(0, 1.18fr);
+  gap: 14px;
+  align-items: start;
+}
+
 .builder-panel,
-.runtime-panel {
+.runtime-panel,
+.prompt-panel {
   padding: 18px;
 }
 
@@ -765,6 +773,65 @@ svg {
   gap: 12px;
 }
 
+.builder-summary {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.form-section {
+  display: grid;
+  gap: 9px;
+  padding-top: 2px;
+}
+
+.form-section + .form-section {
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.form-section-title {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 780;
+  text-transform: uppercase;
+}
+
+.field-hint {
+  margin: -3px 0 2px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.model-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 40px;
+  gap: 8px;
+  align-items: center;
+}
+
+.model-refresh-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  min-width: 40px;
+  height: 40px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--text-soft);
+  cursor: pointer;
+}
+
+.model-refresh-button:disabled {
+  cursor: wait;
+  opacity: 0.68;
+}
+
 label {
   color: var(--text-soft);
   font-size: 0.82rem;
@@ -786,6 +853,18 @@ textarea {
 input,
 select {
   padding: 0 11px;
+}
+
+.prompt-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.custom-prompt-textarea {
+  min-height: 220px;
+  padding: 11px;
+  resize: vertical;
+  line-height: 1.55;
 }
 
 .action-cluster {
@@ -870,6 +949,103 @@ select {
 
 .section-title svg {
   color: var(--accent);
+}
+
+.run-status-card {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.run-status-card.is-running,
+.run-status-card.is-queued {
+  border-color: rgba(231, 182, 95, 0.28);
+  background: linear-gradient(180deg, rgba(231, 182, 95, 0.08), rgba(231, 182, 95, 0.025)), var(--surface);
+}
+
+.run-status-card.is-waiting {
+  border-color: rgba(231, 182, 95, 0.42);
+  background: var(--warning-muted);
+}
+
+.run-status-card.is-complete {
+  border-color: rgba(117, 216, 143, 0.3);
+  background: var(--success-muted);
+}
+
+.run-status-card.is-failed {
+  border-color: rgba(255, 156, 174, 0.36);
+  background: rgba(255, 156, 174, 0.12);
+}
+
+.run-status-main {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+}
+
+.run-status-icon {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--accent-strong);
+}
+
+.run-status-main strong,
+.run-status-main small {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.run-status-main strong {
+  color: var(--text);
+  font-size: 0.88rem;
+}
+
+.run-status-main small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.run-status-card .run-progress {
+  margin: 0;
+}
+
+.run-status-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.run-status-meta span {
+  min-width: 0;
+  padding: 6px 7px;
+  border: 1px solid rgba(144, 166, 184, 0.14);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-soft);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  overflow-wrap: anywhere;
+}
+
+.run-status-warning,
+.runtime-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.45;
 }
 
 .step-list {
@@ -1010,6 +1186,72 @@ select {
   font-family: var(--font-mono);
   font-size: 0.76rem;
   font-weight: 780;
+}
+
+.activity-log {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 14px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.activity-log__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-soft);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+
+.activity-log__header strong {
+  color: var(--accent-strong);
+  font-weight: 760;
+}
+
+.activity-log ol {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.activity-log li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 8px;
+  align-items: center;
+  min-width: 0;
+  color: var(--text-soft);
+  font-size: 0.76rem;
+}
+
+.activity-log li > span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-kind {
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: var(--accent-muted);
+  color: var(--accent-strong);
+  font-family: var(--font-mono);
+  font-size: 0.67rem;
+}
+
+.activity-log small {
+  grid-column: 2;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  overflow-wrap: anywhere;
 }
 
 .metric-list div {
@@ -1712,7 +1954,8 @@ code {
 .toc-part button:focus-visible,
 .outline-part button:focus-visible,
 input:focus-visible,
-select:focus-visible {
+select:focus-visible,
+textarea:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
@@ -1722,7 +1965,12 @@ select:focus-visible {
     grid-template-columns: minmax(230px, 280px) minmax(0, 1fr);
   }
 
-  .runtime-panel {
+  .generation-progress-grid {
+    grid-template-columns: minmax(280px, 0.86fr) minmax(0, 1.14fr);
+  }
+
+  .generation-grid > .runtime-panel,
+  .generation-grid > .prompt-panel {
     grid-column: 2;
   }
 }
@@ -1784,6 +2032,7 @@ select:focus-visible {
 
   .books-layout,
   .generation-grid,
+  .generation-progress-grid,
   .reader-shell {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1809,6 +2058,7 @@ select:focus-visible {
   }
 
   .runtime-panel,
+  .prompt-panel,
   .mentor-panel {
     grid-column: auto;
   }
@@ -1927,6 +2177,7 @@ select:focus-visible {
 
   .builder-panel,
   .runtime-panel,
+  .prompt-panel,
   .outline-part,
   .reader-toc,
   .mentor-panel {
@@ -1935,6 +2186,18 @@ select:focus-visible {
 
   .builder-panel h1 {
     font-size: 1.42rem;
+  }
+
+  .run-status-meta {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .activity-log li {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .activity-log small {
+    grid-column: auto;
   }
 
   .book-cover-tile {

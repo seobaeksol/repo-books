@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",
+    "@lmstudio/sdk": "^1.5.0",
     "@repo-books/shared": "workspace:*",
     "better-sqlite3": "^11.5.0",
     "fastify": "^5.1.0",

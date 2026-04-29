@@ -1,16 +1,216 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+type MockChatMessage = { role: string; content: string };
+type MockMode = "success" | "model-error" | "missing-then-success" | "bad-section-draft";
+
+const lmStudioMock = vi.hoisted(() => {
+  let mode: MockMode = "success";
+  let payloadFactory: (schemaName: string, context: Record<string, unknown>) => unknown = () => ({});
+  const modelKeys: string[] = [];
+  const modelAttempts = new Map<string, number>();
+  const contexts: Record<string, unknown>[] = [];
+  const chats: MockChatMessage[][] = [];
+  const respondOptions: Record<string, unknown>[] = [];
+
+  const parsePrompt = (chat: unknown) => {
+    const messages = Array.isArray(chat) ? (chat as MockChatMessage[]) : [{ role: "user", content: String(chat) }];
+    const userMessage = [...messages].reverse().find((message) => message.role === "user");
+    try {
+      return JSON.parse(userMessage?.content ?? "{}") as { schemaName?: string; context?: Record<string, unknown> };
+    } catch {
+      return { schemaName: undefined, context: {} };
+    }
+  };
+
+  const respond = vi.fn(async (chat: unknown, options: Record<string, unknown>) => {
+    const messages = Array.isArray(chat) ? (chat as MockChatMessage[]) : [{ role: "user", content: String(chat) }];
+    chats.push(messages);
+    respondOptions.push(options);
+    const prompt = parsePrompt(chat);
+    const context = prompt.context ?? {};
+    contexts.push(context);
+    const content =
+      mode === "bad-section-draft" && prompt.schemaName === "RepoBookSectionDraft"
+        ? {
+            body: [
+              "이 테스트는 SDK 메타 응답이 JSON parsing 처리를 통과하는지 확인하기 위해 충분히 긴 prose를 제공합니다.",
+              "모델 응답과 프롬프트 처리 상태를 설명하는 문장이므로 독자가 읽는 저장소 기술서 본문에는 저장되면 안 됩니다."
+            ].join("\n\n")
+          }
+        : payloadFactory(prompt.schemaName ?? "", context);
+    return { content: JSON.stringify(content), parsed: content };
+  });
+
+  const model = vi.fn((modelKey: string) => {
+    modelKeys.push(modelKey);
+    const nextAttempt = (modelAttempts.get(modelKey) ?? 0) + 1;
+    modelAttempts.set(modelKey, nextAttempt);
+    if (mode === "model-error") throw new Error("LM Studio SDK model unavailable");
+    if (mode === "missing-then-success" && nextAttempt === 1) throw new Error(`Model not found: ${modelKey}`);
+    return { respond };
+  });
+
+  const LMStudioClient = vi.fn(() => ({
+    llm: { model }
+  }));
+
+  return {
+    LMStudioClient,
+    setMode: (nextMode: MockMode) => {
+      mode = nextMode;
+    },
+    setPayloadFactory: (factory: (schemaName: string, context: Record<string, unknown>) => unknown) => {
+      payloadFactory = factory;
+    },
+    reset: () => {
+      mode = "success";
+      modelKeys.length = 0;
+      modelAttempts.clear();
+      contexts.length = 0;
+      chats.length = 0;
+      respondOptions.length = 0;
+      respond.mockClear();
+      model.mockClear();
+      LMStudioClient.mockClear();
+    },
+    requests: () => respond.mock.calls.length,
+    modelKeys: () => [...modelKeys],
+    contexts: () => [...contexts],
+    chats: () => [...chats],
+    respondOptions: () => [...respondOptions]
+  };
+});
+
+const lmsMock = vi.hoisted(() => {
+  let downloadMode: "success" | "error" = "success";
+  let listMode: "success" | "error" = "success";
+  let listPayload: unknown = [
+    {
+      model: {
+        type: "llm",
+        modelKey: "google/gemma-4-e4b",
+        format: "gguf",
+        displayName: "Gemma 4 E4B",
+        publisher: "google",
+        path: "google/gemma-4-e4b",
+        sizeBytes: 6326936720,
+        paramsString: "7.5B",
+        architecture: "gemma4",
+        quantization: { name: "Q4_K_M", bits: 4 },
+        variants: ["google/gemma-4-e4b@q4_k_m"],
+        selectedVariant: "google/gemma-4-e4b@q4_k_m",
+        vision: true,
+        trainedForToolUse: true,
+        maxContextLength: 131072
+      },
+      variants: [
+        {
+          type: "llm",
+          modelKey: "google/gemma-4-e4b@q4_k_m",
+          format: "gguf",
+          displayName: "Gemma 4 E4B",
+          publisher: "google",
+          path: "google/gemma-4-e4b",
+          sizeBytes: 6326936720,
+          paramsString: "7.5B",
+          architecture: "gemma4",
+          quantization: { name: "Q4_K_M", bits: 4 },
+          vision: true,
+          trainedForToolUse: true,
+          maxContextLength: 131072
+        }
+      ]
+    }
+  ];
+  const execFile = vi.fn((command: string, args: string[], options: Record<string, unknown>, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
+    void options;
+    setImmediate(() => {
+      if (args[0] === "ls") {
+        if (listMode === "error") callback(Object.assign(new Error("lms list failed"), { code: 1, stderr: "\u001b[91mnot ready\u001b[39m" }), "", "\u001b[91mnot ready\u001b[39m");
+        else callback(null, JSON.stringify(listPayload), "");
+        return;
+      }
+      if (downloadMode === "error") callback(Object.assign(new Error("lms download failed"), { code: 1, stderr: "not found" }), "", "not found");
+      else callback(null, "downloaded", "");
+    });
+    return { pid: 1, kill: vi.fn() };
+  });
+
+  return {
+    execFile,
+    setMode: (nextMode: "success" | "error") => {
+      downloadMode = nextMode;
+    },
+    setListMode: (nextMode: "success" | "error") => {
+      listMode = nextMode;
+    },
+    setListPayload: (nextPayload: unknown) => {
+      listPayload = nextPayload;
+    },
+    reset: () => {
+      downloadMode = "success";
+      listMode = "success";
+      listPayload = [
+        {
+          model: {
+            type: "llm",
+            modelKey: "google/gemma-4-e4b",
+            format: "gguf",
+            displayName: "Gemma 4 E4B",
+            publisher: "google",
+            path: "google/gemma-4-e4b",
+            sizeBytes: 6326936720,
+            paramsString: "7.5B",
+            architecture: "gemma4",
+            quantization: { name: "Q4_K_M", bits: 4 },
+            variants: ["google/gemma-4-e4b@q4_k_m"],
+            selectedVariant: "google/gemma-4-e4b@q4_k_m",
+            vision: true,
+            trainedForToolUse: true,
+            maxContextLength: 131072
+          },
+          variants: [
+            {
+              type: "llm",
+              modelKey: "google/gemma-4-e4b@q4_k_m",
+              format: "gguf",
+              displayName: "Gemma 4 E4B",
+              publisher: "google",
+              path: "google/gemma-4-e4b",
+              sizeBytes: 6326936720,
+              paramsString: "7.5B",
+              architecture: "gemma4",
+              quantization: { name: "Q4_K_M", bits: 4 },
+              vision: true,
+              trainedForToolUse: true,
+              maxContextLength: 131072
+            }
+          ]
+        }
+      ];
+      execFile.mockClear();
+    },
+    calls: () => execFile.mock.calls.map(([command, args]) => ({ command, args }))
+  };
+});
+
+vi.mock("@lmstudio/sdk", () => ({
+  LMStudioClient: lmStudioMock.LMStudioClient
+}));
+
+vi.mock("node:child_process", () => ({
+  execFile: lmsMock.execFile
+}));
+
 import { createApp, type RepoBooksApp } from "../src/app.js";
+import { resetLmStudioModelCache } from "../src/lmStudioModels.js";
 
 let app: RepoBooksApp;
 let tempDir: string;
 let dbPath: string;
-let previousLmStudioBaseUrl: string | undefined;
-let previousLmStudioTimeoutMs: string | undefined;
 
 const makeApp = async () => {
   app = await createApp({ dbPath });
@@ -18,10 +218,10 @@ const makeApp = async () => {
 };
 
 beforeEach(async () => {
-  previousLmStudioBaseUrl = process.env.LM_STUDIO_BASE_URL;
-  previousLmStudioTimeoutMs = process.env.LM_STUDIO_TIMEOUT_MS;
-  delete process.env.LM_STUDIO_BASE_URL;
-  delete process.env.LM_STUDIO_TIMEOUT_MS;
+  lmStudioMock.reset();
+  lmsMock.reset();
+  resetLmStudioModelCache();
+  lmStudioMock.setPayloadFactory(fakeStructuredPayload);
   tempDir = mkdtempSync(join(tmpdir(), "repo-books-api-"));
   dbPath = join(tempDir, "test.sqlite");
   await makeApp();
@@ -30,16 +230,6 @@ beforeEach(async () => {
 afterEach(async () => {
   if (app) await app.close();
   rmSync(tempDir, { recursive: true, force: true });
-  if (previousLmStudioBaseUrl === undefined) {
-    delete process.env.LM_STUDIO_BASE_URL;
-  } else {
-    process.env.LM_STUDIO_BASE_URL = previousLmStudioBaseUrl;
-  }
-  if (previousLmStudioTimeoutMs === undefined) {
-    delete process.env.LM_STUDIO_TIMEOUT_MS;
-  } else {
-    process.env.LM_STUDIO_TIMEOUT_MS = previousLmStudioTimeoutMs;
-  }
 });
 
 describe("Repo Books API", () => {
@@ -69,6 +259,72 @@ describe("Repo Books API", () => {
     const books = await app.inject({ method: "GET", url: "/api/books" });
     expect(books.statusCode).toBe(200);
     expect(books.json().books.length).toBeGreaterThan(0);
+  });
+
+  it("lists local LM Studio model variants and caches them", async () => {
+    const first = await app.inject({ method: "GET", url: "/api/lm-studio/models" });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({
+      stale: false,
+      models: [
+        {
+          modelKey: "google/gemma-4-e4b@q4_k_m",
+          displayName: "Gemma 4 E4B",
+          path: "google/gemma-4-e4b",
+          publisher: "google",
+          paramsString: "7.5B",
+          quantization: { name: "Q4_K_M", bits: 4 },
+          sizeBytes: 6326936720,
+          maxContextLength: 131072,
+          vision: true,
+          trainedForToolUse: true,
+          stale: false
+        }
+      ]
+    });
+
+    const second = await app.inject({ method: "GET", url: "/api/lm-studio/models" });
+    expect(second.statusCode).toBe(200);
+    expect(lmsMock.calls().filter((call) => call.args[0] === "ls")).toHaveLength(1);
+  });
+
+  it("refreshes the LM Studio model list when requested", async () => {
+    await app.inject({ method: "GET", url: "/api/lm-studio/models" });
+    lmsMock.setListPayload([
+      {
+        model: { type: "llm", modelKey: "qwen/qwen3-4b-2507", displayName: "Qwen3 4B", publisher: "qwen", path: "qwen/qwen3-4b-2507" },
+        variants: [{ type: "llm", modelKey: "qwen/qwen3-4b-2507@q4_k_m", displayName: "Qwen3 4B", publisher: "qwen", path: "qwen/qwen3-4b-2507", quantization: { name: "Q4_K_M", bits: 4 } }]
+      }
+    ]);
+
+    const refreshed = await app.inject({ method: "GET", url: "/api/lm-studio/models?refresh=1" });
+    expect(refreshed.statusCode).toBe(200);
+    expect(refreshed.json().models[0]).toMatchObject({ modelKey: "qwen/qwen3-4b-2507@q4_k_m", stale: false });
+    expect(lmsMock.calls().filter((call) => call.args[0] === "ls")).toHaveLength(2);
+  });
+
+  it("returns stale LM Studio models when refresh fails after a successful cache", async () => {
+    await app.inject({ method: "GET", url: "/api/lm-studio/models" });
+    lmsMock.setListMode("error");
+
+    const stale = await app.inject({ method: "GET", url: "/api/lm-studio/models?refresh=1" });
+    expect(stale.statusCode).toBe(200);
+    expect(stale.json()).toMatchObject({
+      stale: true,
+      models: [{ modelKey: "google/gemma-4-e4b@q4_k_m", stale: true }]
+    });
+    expect(stale.json().error).toContain("LM_STUDIO_MODEL_LIST_FAILED");
+    expect(stale.json().error).not.toContain("\u001b");
+  });
+
+  it("returns an empty LM Studio model list when lms fails before cache exists", async () => {
+    lmsMock.setListMode("error");
+
+    const failed = await app.inject({ method: "GET", url: "/api/lm-studio/models" });
+    expect(failed.statusCode).toBe(200);
+    expect(failed.json()).toMatchObject({ models: [], cachedAt: null, stale: false });
+    expect(failed.json().error).toContain("LM_STUDIO_MODEL_LIST_FAILED");
+    expect(failed.json().error).not.toContain("\u001b");
   });
 
   it("lists and loads book details with filters", async () => {
@@ -204,40 +460,37 @@ describe("Repo Books API", () => {
     expect(imported.json().snapshot.users.map((user: { id: string }) => user.id)).toEqual(expect.arrayContaining(["snapshot-user"]));
   });
 
-  it("creates an esp-hal tuned generation run from an indexed repository", async () => {
-    const fixturePath = createEspHalFixture(tempDir);
+  it("creates a generated book from an indexed repository using the SDK model", async () => {
+    const fixturePath = createGenericFixture(tempDir);
     const response = await app.inject({
       method: "POST",
       url: "/api/generation/outline",
       payload: {
         repoUrl: fixturePath,
-        model: "qwen3-coder 14B",
-        audience: "embedded Rust maintainer",
-        depth: "deep"
+        model: "google/gemma-4-E4B-it",
+        readerLevel: "설계자",
+        bookPurpose: "구조 이해",
+        depth: "deep",
+        customPrompt: "테스트 전략을 각 장의 체크포인트에 반영"
       }
     });
     expect(response.statusCode).toBe(200);
     const book = response.json().book;
-    expect(book.title).toBe("esp-hal을 읽는 책");
-    expect(book.repo).toContain("esp-hal");
-    expect(book.subtitle).toEqual(expect.stringContaining("embedded Rust maintainer"));
-    expect(book.subtitle).toEqual(expect.stringContaining("no_std HAL"));
-    expect(book.parts.map((part: { title: string }) => part.title)).toEqual([
-      "Part I. esp-hal 지형도",
-      "Part II. 부팅, 칩 추상화, 시스템 초기화",
-      "Part III. Peripheral driver를 읽는 법",
-      "Part IV. Async, radio, examples",
-      "Part V. 검증, 설정, 기여"
-    ]);
-    expect(book.chapters.length).toBeGreaterThanOrEqual(14);
+    expect(book.title).toContain("sample-service");
+    expect(book.repo).toContain("sample-service");
+    expect(book.model).toContain("google/gemma-4-E4B-it");
+    expect(book.subtitle).toEqual(expect.stringContaining("설계자"));
+    expect(book.subtitle).toEqual(expect.stringContaining("구조 이해"));
+    expect(book.parts.map((part: { title: string }) => part.title)).toEqual(
+      expect.arrayContaining(["Part I. 저장소 방향", "Part II. 실행 흐름"])
+    );
+    expect(book.chapters.length).toBeGreaterThanOrEqual(4);
     expect(book.chapters.map((chapter: { title: string }) => chapter.title)).toEqual(
-      expect.arrayContaining(["DMA와 버퍼 ownership", "GPIO, IO mux, interrupt의 기본 문법", "HIL, QA, compile-tests로 신뢰도 읽기"])
+      expect.arrayContaining(["서비스 진입점과 공개 계약", "도메인 규칙과 데이터 흐름"])
     );
-    expect(book.chapters.find((chapter: { title: string }) => chapter.title.includes("DMA")).files).toEqual(
-      expect.arrayContaining(["esp-hal/src/dma/mod.rs", "esp-hal/src/dma/buffers.rs"])
-    );
-    expect(book.chapters[0].keyQuestion).toContain("Bare-metal Rust HAL");
-    expect(book.chapters[0].responsibility).toContain("no_std Rust");
+    expect(book.chapters[0].files).toEqual(expect.arrayContaining(["src/server.ts", "src/routes/books.ts"]));
+    expect(book.chapters[0].keyQuestion).toBeTruthy();
+    expect(book.chapters[0].responsibility).toBeTruthy();
     expect(book.chapters[0].flow.title).toBeTruthy();
     expect(book.chapters[0].codeAnchors.length).toBeGreaterThanOrEqual(2);
     expect(book.chapters[0].evidence.length).toBeGreaterThanOrEqual(2);
@@ -248,16 +501,34 @@ describe("Repo Books API", () => {
     expect(response.json().generationRun).toMatchObject({
       repoUrl: fixturePath,
       branch: "main",
+      model: "google/gemma-4-E4B-it",
       bookId: book.id,
       status: "complete",
       progress: 100
     });
     expect(response.json().generationRun.steps.map((step: { detail: string }) => step.detail)).toEqual(
-      expect.arrayContaining([expect.stringContaining("embedded-hal"), "local structured generation"])
+      expect.arrayContaining([expect.stringContaining("structured LM calls succeeded")])
     );
-    expect(response.json().generationRun.outline).toHaveLength(5);
+    expect(response.json().generationRun.steps.map((step: { detail: string }) => step.detail)).not.toContain("local structured generation");
+    expect(response.json().generationRun.outline.length).toBeGreaterThanOrEqual(2);
     expect(response.json().generationRun.artifacts.map((artifact: { kind: string }) => artifact.kind)).toEqual(
       expect.arrayContaining(["repository_analysis", "part_plan", "chapter_plan", "chapter_brief", "section_plan", "section_draft", "chapter_revision", "book_coherence", "quality_issues"])
+    );
+    expect(new Set(lmStudioMock.modelKeys())).toEqual(new Set(["google/gemma-4-E4B-it"]));
+    expect(
+      lmStudioMock.contexts().some(
+        (context) => context.readerLevel === "설계자" && context.bookPurpose === "구조 이해" && context.customPrompt === "테스트 전략을 각 장의 체크포인트에 반영"
+      )
+    ).toBe(true);
+    expect(lmStudioMock.chats().every((chat) => chat.some((message) => message.role === "system") && chat.some((message) => message.role === "user"))).toBe(true);
+    expect(lmStudioMock.respondOptions()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          structured: expect.objectContaining({ type: "json" }),
+          maxTokens: expect.any(Number),
+          temperature: expect.any(Number)
+        })
+      ])
     );
 
     const events = await app.inject({ method: "GET", url: `/api/generation/runs/${response.json().generationRun.id}/events` });
@@ -273,67 +544,90 @@ describe("Repo Books API", () => {
     expect(detail.json().readingState).toMatchObject({ bookId: book.id, chapterId: book.currentChapterId, progressPercent: book.progress });
   });
 
-  it("marks chapters failed when configured LM Studio is unavailable", async () => {
-    process.env.LM_STUDIO_BASE_URL = "http://127.0.0.1:9";
-    process.env.LM_STUDIO_TIMEOUT_MS = "50";
+  it("downloads a missing LM Studio model with lms get before generation", async () => {
+    lmStudioMock.setMode("missing-then-success");
+    const fixturePath = createGenericFixture(tempDir);
     const response = await app.inject({
       method: "POST",
       url: "/api/generation/outline",
       payload: {
-        repoUrl: createEspHalFixture(tempDir),
-        model: "qwen3-coder 14B",
-        audience: "embedded Rust maintainer",
+        repoUrl: fixturePath,
+        model: "qwen/qwen3-4b-2507",
+        readerLevel: "설계자",
+        bookPurpose: "구조 이해",
+        depth: "balanced"
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(lmsMock.calls()).toEqual([{ command: "lms", args: ["get", "qwen/qwen3-4b-2507"] }]);
+    expect(lmStudioMock.modelKeys().filter((key) => key === "qwen/qwen3-4b-2507")).toHaveLength(2);
+    expect(response.json().generationRun.steps[0]).toMatchObject({
+      label: "모델 준비",
+      state: "complete",
+      detail: expect.stringContaining("1/1 missing model downloads completed")
+    });
+  });
+
+  it("marks background generation failed when the SDK model cannot be loaded", async () => {
+    lmStudioMock.setMode("model-error");
+    const queued = await app.inject({
+      method: "POST",
+      url: "/api/generation/runs",
+      payload: {
+        repoUrl: createGenericFixture(tempDir),
+        model: "missing-local-model",
+        readerLevel: "유지보수자",
+        bookPurpose: "변경 준비",
+        depth: "balanced",
+        background: true
+      }
+    });
+
+    expect(queued.statusCode).toBe(202);
+    expect(queued.json().book).toMatchObject({ status: "generating", statusLabel: "생성 대기 중", progress: 0 });
+    const polled = await waitForGenerationRun(queued.json().generationRun.id);
+    expect(polled.generationRun.status).toBe("failed");
+    expect(polled.generationRun.error).toContain("LM Studio SDK model unavailable");
+    expect(polled.book).toMatchObject({ status: "generating", statusLabel: "생성 실패" });
+    expect(lmStudioMock.modelKeys()).toContain("missing-local-model");
+    expect(lmsMock.calls()).toEqual([{ command: "lms", args: ["get", "missing-local-model"] }]);
+  });
+
+  it("rejects meta SDK prose and records failed chapter text without deterministic prose fallback", async () => {
+    lmStudioMock.setMode("bad-section-draft");
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/generation/outline",
+      payload: {
+        repoUrl: createGenericFixture(tempDir),
+        model: "google/gemma-4-E4B-it",
+        readerLevel: "유지보수자",
+        bookPurpose: "변경 준비",
         depth: "balanced"
       }
     });
 
     expect(response.statusCode).toBe(200);
     const body = response.json();
-    expect(body.generationRun.steps.map((step: { detail: string }) => step.detail)).toEqual(
-      expect.arrayContaining([expect.stringContaining("LM Studio structured generation failed")])
-    );
+    expect(lmStudioMock.requests()).toBeGreaterThan(1);
+    expect(JSON.stringify(body.book.chapters[0].sections)).not.toContain("JSON parsing");
     expect(body.generationRun.chapterRuns.some((chapter: { status: string }) => chapter.status === "failed")).toBe(true);
-    expect(body.generationRun.artifacts.some((artifact: { kind: string; payload: { status?: string } }) => artifact.kind === "section_draft" && artifact.payload.status === "failed")).toBe(true);
+    expect(body.generationRun.artifacts.some((artifact: { kind: string; payload: { error?: string } }) => artifact.kind === "section_draft" && artifact.payload.error)).toBe(true);
+    expect(new Set(lmStudioMock.modelKeys())).toEqual(new Set(["google/gemma-4-E4B-it"]));
   });
 
-  it("rejects meta LM Studio prose and records failed chapter text without deterministic prose fallback", async () => {
-    const lmStudio = await startBadLmStudio();
-    try {
-      process.env.LM_STUDIO_BASE_URL = lmStudio.baseUrl;
-      process.env.LM_STUDIO_TIMEOUT_MS = "2000";
-      const response = await app.inject({
-        method: "POST",
-        url: "/api/generation/outline",
-        payload: {
-          repoUrl: createEspHalFixture(tempDir),
-          model: "qwen3-coder 14B",
-          audience: "embedded Rust maintainer",
-          depth: "balanced"
-        }
-      });
-
-      expect(response.statusCode).toBe(200);
-      const body = response.json();
-      expect(lmStudio.requests()).toBeGreaterThan(1);
-      expect(JSON.stringify(body.book.chapters[0].sections)).not.toContain("JSON parsing");
-      expect(body.generationRun.chapterRuns.some((chapter: { status: string }) => chapter.status === "failed")).toBe(true);
-      expect(body.generationRun.artifacts.some((artifact: { kind: string; payload: { error?: string } }) => artifact.kind === "section_draft" && artifact.payload.error)).toBe(true);
-    } finally {
-      await lmStudio.close();
-    }
-  });
-
-  it("queues background generation runs and repairs failed chapters from stored evidence", async () => {
-    process.env.LM_STUDIO_BASE_URL = "http://127.0.0.1:9";
-    process.env.LM_STUDIO_TIMEOUT_MS = "50";
+  it("regenerates failed chapters through the SDK retry path", async () => {
+    lmStudioMock.setMode("bad-section-draft");
 
     const queued = await app.inject({
       method: "POST",
       url: "/api/generation/runs",
       payload: {
-        repoUrl: createEspHalFixture(tempDir),
-        model: "qwen3-coder 14B",
-        audience: "embedded Rust maintainer",
+        repoUrl: createGenericFixture(tempDir),
+        model: "google/gemma-4-E4B-it",
+        readerLevel: "유지보수자",
+        bookPurpose: "변경 준비",
         depth: "balanced",
         background: true
       }
@@ -342,62 +636,63 @@ describe("Repo Books API", () => {
     expect(queued.statusCode).toBe(202);
     const runId = queued.json().generationRun.id;
     expect(queued.json().generationRun.status).toBe("queued");
-    expect(queued.json().book).toBeNull();
+    expect(queued.json().book).toMatchObject({ status: "generating", generationRunId: runId });
 
     const polled = await waitForGenerationRun(runId);
     expect(polled.generationRun.status).toBe("complete");
+    expect(polled.generationRun.model).toBe("google/gemma-4-E4B-it");
     expect(polled.book.id).toBe(polled.generationRun.bookId);
+    expect(polled.book.subtitle).toContain("유지보수자");
+    expect(polled.book.subtitle).toContain("변경 준비");
 
     const failedChapters = polled.generationRun.chapterRuns.filter((chapter: { status: string }) => chapter.status === "failed");
     expect(failedChapters.length).toBeGreaterThan(0);
 
+    lmStudioMock.setMode("success");
     const singleRetry = await app.inject({
       method: "POST",
       url: `/api/generation/runs/${runId}/chapters/${failedChapters[0].chapterId}/retry`
     });
     expect(singleRetry.statusCode).toBe(200);
     expect(singleRetry.json().retried).toBe(1);
+    expect(singleRetry.json().generationRun.chapterRuns.every((chapter: { status: string }) => chapter.status === "complete")).toBe(true);
+    expect(singleRetry.json().generationRun.chapterRuns.every((chapter: { source: string }) => chapter.source === "LM Studio TypeScript SDK")).toBe(true);
 
-    delete process.env.LM_STUDIO_BASE_URL;
     const retry = await app.inject({
       method: "POST",
       url: `/api/generation/runs/${runId}/retry-failed-chapters`
     });
 
     expect(retry.statusCode).toBe(200);
-    expect(retry.json().retried).toBe(Math.max(0, failedChapters.length - 1));
+    expect(retry.json().retried).toBe(0);
     expect(retry.json().generationRun.chapterRuns.every((chapter: { status: string }) => chapter.status === "complete")).toBe(true);
-    expect(retry.json().generationRun.chapterRuns.some((chapter: { source: string }) => chapter.source === "chapter repair retry")).toBe(true);
     expect(retry.json().book.chapters.every((chapter: { sections: unknown[] }) => chapter.sections.length >= 5)).toBe(true);
+    expect(new Set(lmStudioMock.modelKeys())).toEqual(new Set(["google/gemma-4-E4B-it"]));
   });
 
-  it("uses an OpenAI-compatible LM Studio adapter when available", async () => {
-    const lmStudio = await startFakeLmStudio();
-    try {
-      process.env.LM_STUDIO_BASE_URL = lmStudio.baseUrl;
-      process.env.LM_STUDIO_TIMEOUT_MS = "2000";
-      const response = await app.inject({
-        method: "POST",
-        url: "/api/generation/outline",
-        payload: {
-          repoUrl: createEspHalFixture(tempDir),
-          model: "qwen3-coder 14B",
-          audience: "embedded Rust maintainer",
-          depth: "deep"
-        }
-      });
+  it("uses the @lmstudio/sdk structured JSON adapter when available", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/generation/outline",
+      payload: {
+        repoUrl: createGenericFixture(tempDir),
+        model: "google/gemma-4-E4B-it",
+        readerLevel: "설계자",
+        bookPurpose: "구조 이해",
+        depth: "deep"
+      }
+    });
 
-      expect(response.statusCode).toBe(200);
-      const body = response.json();
-      expect(lmStudio.requests()).toBeGreaterThan(body.book.chapters.length);
-      expect(body.book.chapters[0].sections[0].body).toContain("저장소 책임");
-      expect(body.book.chapters[0].sections[0].body).not.toContain("JSON parsing");
-      expect(body.generationRun.steps.map((step: { detail: string }) => step.detail)).toEqual(
-        expect.arrayContaining([expect.stringContaining("structured LM calls succeeded")])
-      );
-    } finally {
-      await lmStudio.close();
-    }
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(lmStudioMock.requests()).toBeGreaterThan(body.book.chapters.length);
+    expect(lmStudioMock.modelKeys()).toEqual(expect.arrayContaining(["google/gemma-4-E4B-it"]));
+    expect(lmStudioMock.contexts().some((context) => context.readerLevel === "설계자" && context.bookPurpose === "구조 이해")).toBe(true);
+    expect(body.book.chapters[0].sections[0].body).toContain("저장소 책임");
+    expect(body.book.chapters[0].sections[0].body).not.toContain("JSON parsing");
+    expect(body.generationRun.steps.map((step: { detail: string }) => step.detail)).toEqual(
+      expect.arrayContaining([expect.stringContaining("structured LM calls succeeded")])
+    );
   });
 
   it("creates default tutor threads for a context and persists contextual replies", async () => {
@@ -444,70 +739,31 @@ async function waitForGenerationRun(runId: string) {
   throw new Error(`Generation run ${runId} did not finish`);
 }
 
-function createEspHalFixture(root: string) {
-  const repoPath = join(root, "esp-hal");
-  writeFixture(repoPath, "README.md", "# esp-hal\n\nBare-metal `no_std` hardware abstraction layer for Espressif devices including ESP32, ESP32-C3, ESP32-C6, ESP32-S2, and ESP32-S3.\n");
+function createGenericFixture(root: string) {
+  const repoPath = join(root, "sample-service");
+  writeFixture(repoPath, "README.md", "# sample-service\n\nA small TypeScript service that exposes book routes, domain rules, repository storage, and worker jobs.\n");
   writeFixture(
     repoPath,
-    "Cargo.toml",
-    '[workspace]\nmembers = ["esp-hal", "esp-backtrace", "esp-config", "esp-println", "esp-radio", "esp-phy", "esp-riscv-rt", "xtensa-lx-rt"]\nexclude = ["examples"]\n'
+    "package.json",
+    JSON.stringify(
+      {
+        name: "sample-service",
+        scripts: { dev: "tsx src/server.ts", test: "vitest run" },
+        dependencies: { fastify: "^5.0.0", zod: "^3.23.8" },
+        devDependencies: { vitest: "^2.0.0", tsx: "^4.0.0", typescript: "^5.0.0" }
+      },
+      null,
+      2
+    )
   );
-  writeFixture(repoPath, "esp-hal/Cargo.toml", '[package]\nname = "esp-hal"\nversion = "1.0.0"\n\n[dependencies]\nembedded-hal = "1"\nembassy-executor = { version = "0.7", optional = true }\n');
-  writeFixture(repoPath, "esp-hal/README.md", "# esp-hal\n\nCore HAL crate for ESP32 family chips. Supports GPIO, DMA, SPI, I2C, UART, timers, interrupt, and async Embassy integration.\n");
-  writeFixture(repoPath, "esp-hal/src/lib.rs", "#![no_std]\n\npub mod asynch;\npub mod clock;\npub mod delay;\npub mod dma;\npub mod gpio;\npub mod i2c;\npub mod interrupt;\npub mod peripherals;\npub mod spi;\npub mod system;\npub mod timer;\npub mod uart;\n\npub fn init() {}\n");
-  writeFixture(repoPath, "esp-hal/src/peripherals/mod.rs", "pub struct Peripherals;\n\nimpl Peripherals {\n    pub fn take() -> Self { Self }\n}\n");
-  writeFixture(repoPath, "esp-hal/src/system.rs", "pub struct SystemControl;\n\npub fn enable_peripheral() {}\npub fn reset_peripheral() {}\n");
-  writeFixture(repoPath, "esp-hal/src/clock/mod.rs", "pub struct ClockControl;\npub struct CpuClock;\n\npub fn configure_clock() {}\n");
-  writeFixture(repoPath, "esp-hal/src/time.rs", "pub struct Hertz(pub u32);\n");
-  writeFixture(repoPath, "esp-hal/src/delay.rs", "pub struct Delay;\nimpl Delay { pub fn delay_millis(&self, _ms: u32) {} }\n");
-  writeFixture(repoPath, "esp-hal/src/interrupt/mod.rs", "pub struct InterruptHandler;\npub fn enable_interrupt() {}\n");
-  writeFixture(repoPath, "esp-hal/src/gpio/mod.rs", "pub mod embedded_hal_impls;\npub mod interrupt;\n\npub struct InputPin;\npub struct OutputPin;\npub fn into_push_pull_output() {}\n");
-  writeFixture(repoPath, "esp-hal/src/gpio/interrupt.rs", "pub fn listen_gpio_interrupt() {}\n");
-  writeFixture(repoPath, "esp-hal/src/gpio/embedded_hal_impls.rs", "pub trait OutputPin {}\n");
-  writeFixture(repoPath, "esp-hal/src/timer/mod.rs", "pub mod systimer;\npub mod timg;\npub struct Timer;\n");
-  writeFixture(repoPath, "esp-hal/src/timer/systimer.rs", "pub struct SystemTimer;\n");
-  writeFixture(repoPath, "esp-hal/src/timer/timg.rs", "pub struct TimerGroup;\n");
-  writeFixture(repoPath, "esp-hal/src/dma/mod.rs", "pub mod buffers;\npub struct DmaChannel;\npub fn start_transfer() {}\n");
-  writeFixture(repoPath, "esp-hal/src/dma/buffers.rs", "pub struct DmaBuffer;\npub fn split_dma_buffer() {}\n");
-  writeFixture(repoPath, "esp-hal/src/spi/mod.rs", "pub struct Spi;\npub fn transaction() {}\n");
-  writeFixture(repoPath, "esp-hal/src/i2c/mod.rs", "pub struct I2c;\npub fn write_read() {}\n");
-  writeFixture(repoPath, "esp-hal/src/uart/mod.rs", "pub struct Uart;\npub fn read() {}\n");
-  writeFixture(repoPath, "esp-hal/src/i2s/mod.rs", "pub struct I2s;\n");
-  writeFixture(repoPath, "esp-hal/src/rmt.rs", "pub struct Rmt;\n");
-  writeFixture(repoPath, "esp-hal/src/asynch.rs", "pub async fn yield_now() {}\n");
-  writeFixture(repoPath, "esp-hal/esp_config.yml", "ESP_HAL_CONFIG_PLACE_SPI_DRIVER_IN_RAM: false\nESP_HAL_CONFIG_CPU_CLOCK: 160MHz\n");
-  writeFixture(repoPath, "esp-hal/MIGRATING-1.0.0.md", "# Migrating to 1.0.0\n\nBreaking changes for peripheral ownership.\n");
-  writeFixture(repoPath, "esp-hal/MIGRATING-1.1.0.md", "# Migrating to 1.1.0\n\nConfiguration changes.\n");
-  writeFixture(repoPath, "esp-backtrace/Cargo.toml", '[package]\nname = "esp-backtrace"\nversion = "1.0.0"\n');
-  writeFixture(repoPath, "esp-backtrace/src/lib.rs", "#![no_std]\npub fn install_backtrace() {}\n");
-  writeFixture(repoPath, "esp-config/Cargo.toml", '[package]\nname = "esp-config"\nversion = "1.0.0"\n');
-  writeFixture(repoPath, "esp-println/Cargo.toml", '[package]\nname = "esp-println"\nversion = "1.0.0"\n');
-  writeFixture(repoPath, "esp-riscv-rt/Cargo.toml", '[package]\nname = "esp-riscv-rt"\nversion = "1.0.0"\n');
-  writeFixture(repoPath, "esp-riscv-rt/src/lib.rs", "#![no_std]\npub fn riscv_entry() {}\n");
-  writeFixture(repoPath, "xtensa-lx-rt/Cargo.toml", '[package]\nname = "xtensa-lx-rt"\nversion = "1.0.0"\n');
-  writeFixture(repoPath, "xtensa-lx-rt/src/lib.rs", "#![no_std]\npub fn xtensa_entry() {}\n");
-  writeFixture(repoPath, "esp-radio/Cargo.toml", '[package]\nname = "esp-radio"\nversion = "1.0.0"\n');
-  writeFixture(repoPath, "esp-radio/README.md", "# esp-radio\n\nWi-Fi, BLE, and IEEE 802.15.4 support for ESP chips.\n");
-  writeFixture(repoPath, "esp-radio/src/lib.rs", "#![no_std]\npub fn init_radio() {}\n");
-  writeFixture(repoPath, "esp-phy/Cargo.toml", '[package]\nname = "esp-phy"\nversion = "1.0.0"\n');
-  writeFixture(repoPath, "esp-phy/README.md", "# esp-phy\n\nPHY support used by esp-radio.\n");
-  writeFixture(repoPath, "examples/README.md", "# Examples\n\nStart with hello_world, then interrupt, peripheral, async, wifi, and ble examples.\n");
-  writeFixture(repoPath, "examples/hello_world/src/main.rs", "#![no_std]\nfn main() {}\n");
-  writeFixture(repoPath, "examples/interrupt/gpio/Cargo.toml", '[package]\nname = "gpio_interrupt_example"\nversion = "0.0.0"\n');
-  writeFixture(repoPath, "examples/peripheral/twai/Cargo.toml", '[package]\nname = "twai_example"\nversion = "0.0.0"\n');
-  writeFixture(repoPath, "examples/ota/update/Cargo.toml", '[package]\nname = "ota_update_example"\nversion = "0.0.0"\n');
-  writeFixture(repoPath, "examples/async/embassy_hello_world/Cargo.toml", '[package]\nname = "embassy_hello_world"\nversion = "0.0.0"\n');
-  writeFixture(repoPath, "examples/async/embassy_multicore/Cargo.toml", '[package]\nname = "embassy_multicore"\nversion = "0.0.0"\n');
-  writeFixture(repoPath, "examples/async/embassy_spi/Cargo.toml", '[package]\nname = "embassy_spi"\nversion = "0.0.0"\n');
-  writeFixture(repoPath, "examples/async/embassy_serial/Cargo.toml", '[package]\nname = "embassy_serial"\nversion = "0.0.0"\n');
-  writeFixture(repoPath, "examples/wifi/embassy_access_point/Cargo.toml", '[package]\nname = "embassy_access_point"\nversion = "0.0.0"\n');
-  writeFixture(repoPath, "examples/ble/scanner/Cargo.toml", '[package]\nname = "ble_scanner"\nversion = "0.0.0"\n');
-  writeFixture(repoPath, "documentation/HIL-GUIDE.md", "# HIL Guide\n\nHardware-in-the-loop testing checks real boards and chip variants.\n");
-  writeFixture(repoPath, "documentation/DEVELOPER-GUIDELINES.md", "# Developer Guidelines\n\nReview API changes and feature gates carefully.\n");
-  writeFixture(repoPath, "documentation/CONTRIBUTING.md", "# Contributing\n\nRun QA and compile-tests before submitting changes.\n");
-  writeFixture(repoPath, "hil-test/README.md", "# HIL Test\n\nBoard-backed HAL validation.\n");
-  writeFixture(repoPath, "qa-test/README.md", "# QA Test\n\nRelease confidence checks.\n");
-  writeFixture(repoPath, "compile-tests/README.md", "# Compile Tests\n\nAPI compatibility checks.\n");
+  writeFixture(repoPath, "src/server.ts", "import { createApp } from './app';\n\nexport async function startServer() {\n  const app = createApp();\n  await app.listen({ port: 3000 });\n}\n");
+  writeFixture(repoPath, "src/app.ts", "import Fastify from 'fastify';\nimport { registerBookRoutes } from './routes/books';\n\nexport function createApp() {\n  const app = Fastify();\n  registerBookRoutes(app);\n  return app;\n}\n");
+  writeFixture(repoPath, "src/routes/books.ts", "import type { FastifyInstance } from 'fastify';\nimport { listBooks, updateReadingState } from '../domain/books';\n\nexport function registerBookRoutes(app: FastifyInstance) {\n  app.get('/books', async () => ({ books: listBooks() }));\n  app.patch('/books/:id/reading-state', async (request) => updateReadingState(request.params, request.body));\n}\n");
+  writeFixture(repoPath, "src/domain/books.ts", "import { saveReadingState } from '../storage/repository';\n\nexport function listBooks() {\n  return [{ id: 'repo-books', title: 'Repo Books' }];\n}\n\nexport function updateReadingState(params: unknown, payload: unknown) {\n  return saveReadingState({ params, payload, updatedAt: new Date().toISOString() });\n}\n");
+  writeFixture(repoPath, "src/storage/repository.ts", "export function saveReadingState(record: unknown) {\n  return { ok: true, record };\n}\n\nexport function loadSnapshot() {\n  return { users: [], books: [] };\n}\n");
+  writeFixture(repoPath, "src/jobs/sync.ts", "import { loadSnapshot } from '../storage/repository';\n\nexport async function runSyncJob() {\n  const snapshot = loadSnapshot();\n  return { synced: snapshot.books.length };\n}\n");
+  writeFixture(repoPath, "test/books.test.ts", "import { describe, expect, it } from 'vitest';\nimport { listBooks } from '../src/domain/books';\n\ndescribe('books', () => {\n  it('lists seeded books', () => {\n    expect(listBooks()).toHaveLength(1);\n  });\n});\n");
+  writeFixture(repoPath, "docs/architecture.md", "# Architecture\n\nRequests enter through Fastify routes, move into domain functions, persist through repository helpers, and background jobs reuse the same storage contracts.\n");
   return repoPath;
 }
 
@@ -517,44 +773,45 @@ function writeFixture(root: string, path: string, body: string) {
   writeFileSync(fullPath, body, "utf8");
 }
 
-async function startFakeLmStudio() {
-  let requests = 0;
-  const server = createServer((request, response) => {
-    if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
-      response.statusCode = 404;
-      response.end();
-      return;
-    }
-
-    const chunks: Buffer[] = [];
-    request.on("data", (chunk: Buffer) => chunks.push(chunk));
-    request.on("end", () => {
-      requests += 1;
-      const payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
-        messages: Array<{ role: string; content: string }>;
-      };
-      const userMessage = payload.messages.find((message) => message.role === "user");
-      const prompt = JSON.parse(userMessage?.content ?? "{}") as { schemaName?: string; context?: Record<string, unknown> };
-      const context = prompt.context ?? {};
-      const content = fakeStructuredPayload(prompt.schemaName ?? "", context);
-      response.setHeader("Content-Type", "application/json");
-      response.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(content) } }] }));
-    });
-  });
-
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address() as AddressInfo;
-  return {
-    baseUrl: `http://127.0.0.1:${port}`,
-    requests: () => requests,
-    close: () => closeServer(server)
-  };
-}
-
 function fakeStructuredPayload(schemaName: string, context: Record<string, unknown>) {
-  if (schemaName === "RepoBookPartPlan") return { parts: context.fallbackParts ?? [] };
-  if (schemaName === "RepoBookChapterPlan") return { chapters: context.fallbackChapters ?? [] };
-  if (schemaName === "RepoBookChapterBrief") return context.baseBrief ?? {};
+  if (schemaName === "RepoBookPartPlan") {
+    return {
+      parts: [
+        { title: "Part I. 저장소 방향", summary: "서비스가 제공하는 공개 계약과 진입점을 먼저 읽는다." },
+        { title: "Part II. 실행 흐름", summary: "도메인 규칙, 저장소 계층, 작업 흐름이 이어지는 방식을 설명한다." }
+      ]
+    };
+  }
+  if (schemaName === "RepoBookChapterPlan") {
+    const candidateFiles = (context.candidateFiles as Array<{ path: string }> | undefined)?.map((file) => file.path) ?? [];
+    const routeFiles = ["src/server.ts", "src/app.ts", "src/routes/books.ts"].filter((path) => candidateFiles.length === 0 || candidateFiles.includes(path));
+    const domainFiles = ["src/domain/books.ts", "src/storage/repository.ts", "src/jobs/sync.ts"].filter((path) => candidateFiles.length === 0 || candidateFiles.includes(path));
+    return {
+      chapters: [
+        {
+          title: "서비스 진입점과 공개 계약",
+          subtitle: "요청이 서버에서 라우트로 들어오는 경계를 읽는다.",
+          files: routeFiles.length ? routeFiles : ["src/server.ts", "src/app.ts", "src/routes/books.ts"],
+          goals: ["서버 진입점과 라우트 등록 흐름을 설명한다.", "외부 요청이 어떤 공개 계약으로 표현되는지 구분한다."],
+          focus: "Fastify 앱 생성, 라우트 등록, 요청 핸들러가 맡는 책임을 연결한다.",
+          checkpoints: ["라우트 추가 시 앱 등록 지점을 확인한다.", "요청/응답 계약 변경 시 테스트를 함께 갱신한다."],
+          codePath: "src/routes/books.ts",
+          codeLabel: "book route contract"
+        },
+        {
+          title: "도메인 규칙과 데이터 흐름",
+          subtitle: "핸들러 이후 도메인과 저장소가 책임을 나누는 방법을 읽는다.",
+          files: domainFiles.length ? domainFiles : ["src/domain/books.ts", "src/storage/repository.ts", "src/jobs/sync.ts"],
+          goals: ["도메인 함수와 저장소 함수의 책임을 분리해 설명한다.", "동기화 작업이 기존 저장소 계약을 재사용하는 지점을 찾는다."],
+          focus: "도메인 규칙, 저장소 경계, 배경 작업이 같은 데이터 계약으로 이어진다.",
+          checkpoints: ["저장 형식 변경 시 도메인과 작업 경로를 함께 확인한다.", "상태 갱신 부작용이 한 계층에 고립되는지 점검한다."],
+          codePath: "src/domain/books.ts",
+          codeLabel: "domain state update"
+        }
+      ]
+    };
+  }
+  if (schemaName === "RepoBookChapterBrief") return context.evidenceSeed ?? {};
   if (schemaName === "RepoBookSectionPlan") {
     const files = ((context.files as Array<{ path: string }> | undefined) ?? []).map((file) => file.path);
     return {
@@ -582,55 +839,4 @@ function fakeStructuredPayload(schemaName: string, context: Record<string, unkno
   if (schemaName === "RepoBookChapterRevision") return { sections: context.sections ?? [] };
   if (schemaName === "RepoBookCoherenceReview") return { summary: "coherent", missingFlows: [] };
   return {};
-}
-
-async function startBadLmStudio() {
-  let requests = 0;
-  const server = createServer((request, response) => {
-    if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
-      response.statusCode = 404;
-      response.end();
-      return;
-    }
-
-    const chunks: Buffer[] = [];
-    request.on("data", (chunk: Buffer) => chunks.push(chunk));
-    request.on("end", () => {
-      requests += 1;
-      response.setHeader("Content-Type", "application/json");
-      response.end(
-        JSON.stringify({
-          choices: [
-            {
-              message: {
-                content: JSON.stringify({
-                  body: [
-                    "이 테스트는 fake OpenAI-compatible 응답이 adapter와 JSON parsing 처리를 통과하는지 확인하기 위해 충분히 긴 prose를 제공합니다.",
-                    "모델 응답과 프롬프트 처리 상태를 설명하는 문장이므로 독자가 읽는 저장소 기술서 본문에는 저장되면 안 됩니다."
-                  ].join("\n\n")
-                })
-              }
-            }
-          ]
-        })
-      );
-    });
-  });
-
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address() as AddressInfo;
-  return {
-    baseUrl: `http://127.0.0.1:${port}`,
-    requests: () => requests,
-    close: () => closeServer(server)
-  };
-}
-
-function closeServer(server: Server) {
-  return new Promise<void>((resolve, reject) => {
-    server.close((error) => {
-      if (error) reject(error);
-      else resolve();
-    });
-  });
 }

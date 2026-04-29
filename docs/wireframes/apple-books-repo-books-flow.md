@@ -106,14 +106,15 @@ Repo Books는 GitHub 저장소를 책으로 변환해 읽는 ebook 앱이다. �
 flowchart TD
   A["책장"] --> B["새 책 진입(sidebar 또는 bottom nav)"]
   B --> C["목차 생성"]
-  C --> D["저장소 분석과 evidence 색인"]
-  D --> E["Part/Chapter/Section 다단계 생성"]
-  E --> F["읽기 시작"]
-  F --> G["읽기 화면"]
-  G --> H["목차 panel 또는 sheet"]
-  G --> I["AI Tutor panel 또는 sheet"]
-  G --> J["Chapter 진행률 저장"]
-  J --> K["최근 읽은 책 갱신"]
+  C --> D["LM Studio 모델 준비"]
+  D --> E["저장소 분석과 evidence 색인"]
+  E --> F["Part/Chapter/Section 다단계 생성"]
+  F --> G["읽기 시작"]
+  G --> H["읽기 화면"]
+  H --> I["목차 panel 또는 sheet"]
+  H --> J["AI Tutor panel 또는 sheet"]
+  H --> L["Chapter 진행률 저장"]
+  L --> K["최근 읽은 책 갱신"]
   K --> A
 ```
 

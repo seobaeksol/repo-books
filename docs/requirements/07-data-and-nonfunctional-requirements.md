@@ -14,7 +14,8 @@
 | coverTheme | 책 표지 색상/스타일 |
 | lmStudioModel | 생성에 사용한 모델 |
 | audience | 독자 수준 |
-| status | `draft`, `generating`, `in_progress`, `completed`, `failed` |
+| generationRunId | 생성 중 책에서 연결할 GenerationRun ID |
+| status | `draft`, `generating`, `reading`, `complete` |
 | progressPercent | 전체 진행률 |
 | currentChapterId | 마지막으로 읽은 Chapter ID |
 | lastReadAt | 마지막 열람 시각 |
@@ -63,10 +64,13 @@
 | bookId | 책 ID |
 | repositorySnapshotId | 분석 스냅샷 ID |
 | model | 사용 모델 |
-| phase | `저장소 분석`, `대단원 설계`, `소단원 설계`, `근거 수집`, `본문 생성`, `챕터 수리`, `책 일관성 점검`, `failed` |
+| context | 모델 컨텍스트 길이 |
+| phase | `모델 준비`, `저장소 분석`, `대단원 설계`, `소단원 설계`, `근거 수집`, `본문 생성`, `챕터 수리`, `책 일관성 점검`, `failed` |
+| status | `queued`, `running`, `complete`, `failed` |
 | progressPercent | 생성 진행률 |
 | errorMessage | 실패 메시지 |
 | artifacts | 단계별 생성 산출물 목록 |
+| chapterRuns | 챕터별 생성 상태, attempt, source, lastError |
 | createdAt | 생성 시작 시각 |
 | completedAt | 완료 시각 |
 

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_BOOK_PURPOSE,
+  DEFAULT_GENERATION_MODEL,
+  DEFAULT_READER_LEVEL,
   patchReadingStateSchema,
   postGenerationOutlineSchema,
   repoBookSchema,
@@ -34,8 +37,19 @@ describe("shared schemas and fixtures", () => {
     });
     expect(postGenerationOutlineSchema.parse({ repoUrl: "https://github.com/example/repo" })).toMatchObject({
       branch: "main",
-      model: "qwen3-coder 14B",
-      context: "128k"
+      model: DEFAULT_GENERATION_MODEL,
+      context: "128k",
+      audience: DEFAULT_READER_LEVEL,
+      readerLevel: DEFAULT_READER_LEVEL,
+      bookPurpose: DEFAULT_BOOK_PURPOSE,
+      customPrompt: ""
     });
+    expect(postGenerationOutlineSchema.parse({ repoUrl: "repo", customPrompt: "  API chapter first  " }).customPrompt).toBe("API chapter first");
+  });
+
+  it("rejects unsupported generation reader levels and purposes", () => {
+    expect(() => postGenerationOutlineSchema.parse({ repoUrl: "repo", readerLevel: "매우 자세한 junior maintainer" })).toThrow();
+    expect(() => postGenerationOutlineSchema.parse({ repoUrl: "repo", bookPurpose: "그냥 훑기" })).toThrow();
+    expect(() => postGenerationOutlineSchema.parse({ repoUrl: "repo", depth: "unsupported" })).toThrow();
   });
 });

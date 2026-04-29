@@ -37,10 +37,7 @@ export type RepoIndex = {
   signals: {
     isRust: boolean;
     isEmbedded: boolean;
-    isEspHal: boolean;
     noStd: boolean;
-    chips: string[];
-    peripherals: string[];
     examples: string[];
   };
 };
@@ -66,6 +63,10 @@ const textExtensions = new Set([
   ".yml",
   ".yaml",
   ".json",
+  ".js",
+  ".jsx",
+  ".ts",
+  ".tsx",
   ".sh",
   ".py",
   ".c",
@@ -85,7 +86,6 @@ export function buildRepoIndex(source: MaterializedRepository): RepoIndex {
     .map((file) => ({ name: file.packageName ?? "", path: file.path }));
   const topLevelDirs = summarizeTopLevelDirs(files);
   const allText = files.map((file) => `${file.path}\n${file.preview}`).join("\n");
-  const peripherals = inferPeripherals(files);
   const examples = files
     .filter((file) => file.kind === "example")
     .map((file) => file.path.split("/").slice(0, -1).join("/"))
@@ -105,12 +105,7 @@ export function buildRepoIndex(source: MaterializedRepository): RepoIndex {
     signals: {
       isRust: files.some((file) => file.extension === ".rs") || packages.length > 0,
       isEmbedded: /no_std|embedded-hal|embassy|cortex|riscv|xtensa|peripheral/i.test(allText),
-      isEspHal:
-        /esp-hal|esp-rs|Espressif|ESP32|xtensa|riscv32im/i.test(allText) ||
-        files.some((file) => file.path.startsWith("esp-hal/src/")),
       noStd: /#!\[no_std\]|no_std/i.test(allText),
-      chips: inferChips(allText),
-      peripherals,
       examples
     }
   };
@@ -327,22 +322,6 @@ function summarizeTopLevelDirs(files: IndexedFile[]) {
     .map(([name, count]) => ({ name, files: count }))
     .sort((a, b) => b.files - a.files)
     .slice(0, 20);
-}
-
-function inferChips(text: string) {
-  const chips = ["ESP32", "ESP32-C2", "ESP32-C3", "ESP32-C5", "ESP32-C6", "ESP32-C61", "ESP32-H2", "ESP32-S2", "ESP32-S3"];
-  return chips.filter((chip) => new RegExp(`\\b${chip}\\b`, "i").test(text));
-}
-
-function inferPeripherals(files: IndexedFile[]) {
-  const names = new Set<string>();
-  for (const file of files) {
-    const match = file.path.match(/^esp-hal\/src\/([^/]+)/);
-    if (!match?.[1]) continue;
-    const ignored = new Set(["lib.rs", "fmt.rs", "macros.rs", "private.rs", "sync.rs", "time.rs"]);
-    if (!ignored.has(match[1])) names.add(match[1].replace(/\.rs$/, ""));
-  }
-  return Array.from(names).sort().slice(0, 40);
 }
 
 function unique<T>(value: T, index: number, values: T[]) {

@@ -3,6 +3,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { ZodError, z } from "zod";
 import {
   importSyncSnapshotSchema,
+  lmStudioModelsResponseSchema,
   listBooksQuerySchema,
   patchUserProfileSchema,
   patchReadingStateSchema,
@@ -13,6 +14,7 @@ import {
   tutorThreadsQuerySchema
 } from "@repo-books/shared";
 import { createRepository, defaultUserId, openDatabase, type RepoBooksRepository } from "./db.js";
+import { listLmStudioModels } from "./lmStudioModels.js";
 
 export type CreateAppOptions = {
   dbPath?: string;
@@ -31,6 +33,7 @@ const threadParamsSchema = z.object({ threadId: z.string().min(1) });
 const userParamsSchema = z.object({ userId: z.string().min(1) });
 const profileParamsSchema = z.object({ profileId: z.string().min(1) });
 const userSelectionQuerySchema = z.object({ userId: z.string().min(1).optional() }).passthrough();
+const lmStudioModelsQuerySchema = z.object({ refresh: z.string().optional() }).passthrough();
 
 const resolveUserId = (request: { query: unknown; headers: Record<string, string | string[] | undefined> }, fallbackUserId = defaultUserId) => {
   const query = userSelectionQuerySchema.safeParse(request.query);
@@ -77,6 +80,11 @@ export const createApp = async (options: CreateAppOptions = {}): Promise<RepoBoo
   });
 
   app.get("/api/health", async () => ({ ok: true }));
+
+  app.get("/api/lm-studio/models", async (request) => {
+    const query = lmStudioModelsQuerySchema.parse(request.query);
+    return lmStudioModelsResponseSchema.parse(await listLmStudioModels({ refresh: query.refresh === "1" || query.refresh === "true" }));
+  });
 
   const activeUserId = () => repo.getSyncStatus().activeProfileId;
   const requestUserId = (request: { query: unknown; headers: Record<string, string | string[] | undefined> }) => resolveUserId(request, activeUserId());
@@ -225,12 +233,12 @@ export const createApp = async (options: CreateAppOptions = {}): Promise<RepoBoo
 
   app.post("/api/generation/runs/:runId/retry-failed-chapters", async (request) => {
     const { runId } = generationRunParamsSchema.parse(request.params);
-    return repo.retryFailedGenerationChapters(runId);
+    return await repo.retryFailedGenerationChapters(runId);
   });
 
   app.post("/api/generation/runs/:runId/chapters/:chapterId/retry", async (request) => {
     const { runId, chapterId } = generationChapterRunParamsSchema.parse(request.params);
-    return repo.retryGenerationChapter(runId, chapterId);
+    return await repo.retryGenerationChapter(runId, chapterId);
   });
 
   app.get("/api/tutor/threads", async (request) => {

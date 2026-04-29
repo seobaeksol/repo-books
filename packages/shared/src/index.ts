@@ -1,5 +1,63 @@
 import { z } from "zod";
 
+export const GENERATION_MODEL_OPTIONS = [
+  {
+    value: "google/gemma-4-e4b",
+    label: "Gemma 4 E4B Instruct",
+    description: "로컬 노트북에서 빠르게 초안을 만들기 좋은 Gemma 4 모델"
+  },
+  {
+    value: "qwen/qwen3-4b-2507",
+    label: "Qwen3 4B 2507",
+    description: "lms get으로 자동 준비하기 쉬운 경량 Qwen3 모델"
+  },
+  {
+    value: "google/gemma-4-26b-a4b",
+    label: "Gemma 4 26B A4B",
+    description: "장문 기술서 구조화와 추론 품질을 우선할 때 적합"
+  },
+  {
+    value: "qwen/qwen3-coder-next",
+    label: "Qwen3-Coder-Next",
+    description: "복잡한 코드 근거와 agentic codebase 분석에 적합"
+  },
+  {
+    value: "mistralai/mistral-nemo-instruct-2407",
+    label: "Mistral Nemo 12B",
+    description: "긴 컨텍스트 기반의 빠른 일반 기술서 생성"
+  }
+] as const;
+
+export const DEFAULT_GENERATION_MODEL = GENERATION_MODEL_OPTIONS[0].value;
+
+export const READER_LEVEL_VALUES = ["입문자", "실무자", "숙련자", "유지보수자", "설계자"] as const;
+export const DEFAULT_READER_LEVEL = "실무자";
+export const READER_LEVEL_OPTIONS = [
+  { value: "입문자", label: "입문자", description: "저장소와 도메인을 처음 접하는 독자에게 용어와 흐름을 단계적으로 설명" },
+  { value: "실무자", label: "실무자", description: "코드는 읽을 수 있지만 전체 구조 파악이 필요한 개발자" },
+  { value: "숙련자", label: "숙련자", description: "모듈 책임, 경계, tradeoff를 빠르게 파악하려는 개발자" },
+  { value: "유지보수자", label: "유지보수자", description: "변경 지점, 회귀 위험, 테스트 근거를 중심으로 읽는 독자" },
+  { value: "설계자", label: "설계자", description: "시스템 구조, 확장성, 아키텍처 판단을 검토하는 독자" }
+] as const satisfies ReadonlyArray<{ value: (typeof READER_LEVEL_VALUES)[number]; label: string; description: string }>;
+
+export const BOOK_PURPOSE_VALUES = ["온보딩", "구조 이해", "변경 준비", "학습 교재", "운영 참고서"] as const;
+export const DEFAULT_BOOK_PURPOSE = "온보딩";
+export const BOOK_PURPOSE_OPTIONS = [
+  { value: "온보딩", label: "온보딩", description: "처음 합류한 개발자가 저장소를 읽고 기여할 수 있게 구성" },
+  { value: "구조 이해", label: "구조 이해", description: "주요 모듈, 실행 흐름, 데이터와 제어 흐름을 큰 그림 중심으로 설명" },
+  { value: "변경 준비", label: "변경 준비", description: "리팩터링, 기능 추가, 마이그레이션 전 확인할 책임과 위험을 정리" },
+  { value: "학습 교재", label: "학습 교재", description: "강의나 스터디처럼 개념, 예시, 체크포인트를 강화" },
+  { value: "운영 참고서", label: "운영 참고서", description: "설정, 배포, 장애 대응, 테스트와 검증 지점을 빠르게 찾게 구성" }
+] as const satisfies ReadonlyArray<{ value: (typeof BOOK_PURPOSE_VALUES)[number]; label: string; description: string }>;
+
+export const GENERATION_DEPTH_VALUES = ["light", "balanced", "deep"] as const;
+export const GENERATION_DEPTH_OPTIONS = [
+  { value: "light", label: "간단히", description: "핵심 목차와 주요 흐름 위주로 빠르게 생성" },
+  { value: "balanced", label: "표준", description: "구조, 근거, 변경 포인트를 균형 있게 생성" },
+  { value: "deep", label: "자세히", description: "구현 이유, 의존성, 영향 범위까지 자세히 생성" }
+] as const satisfies ReadonlyArray<{ value: (typeof GENERATION_DEPTH_VALUES)[number]; label: string; description: string }>;
+export const DEFAULT_GENERATION_DEPTH = "balanced";
+
 export const bookStatusSchema = z.enum(["reading", "complete", "generating", "draft"]);
 export const bookFilterSchema = z.enum(["all", "in_progress", "generating", "draft"]);
 export const chapterStatusSchema = z.enum(["complete", "current", "next", "locked", "draft", "generating", "failed"]);
@@ -8,6 +66,36 @@ export const generationStepStateSchema = z.enum(["pending", "active", "complete"
 export const generationChapterRunStatusSchema = z.enum(["queued", "running", "complete", "failed"]);
 export const tutorMessageRoleSchema = z.enum(["user", "assistant", "system"]);
 export const readerViewSchema = z.enum(["library", "reader", "generation"]);
+
+export const lmStudioQuantizationSchema = z.object({
+  name: z.string().optional(),
+  bits: z.number().optional()
+}).passthrough();
+
+export const lmStudioModelOptionSchema = z.object({
+  modelKey: z.string().min(1),
+  displayName: z.string(),
+  path: z.string(),
+  publisher: z.string(),
+  paramsString: z.string().optional(),
+  quantization: lmStudioQuantizationSchema.nullable(),
+  sizeBytes: z.number().nullable(),
+  maxContextLength: z.number().nullable(),
+  vision: z.boolean(),
+  trainedForToolUse: z.boolean(),
+  cachedAt: z.string(),
+  stale: z.boolean()
+});
+
+export const lmStudioModelsResponseSchema = z.object({
+  models: z.array(lmStudioModelOptionSchema),
+  cachedAt: z.string().nullable(),
+  stale: z.boolean(),
+  error: z.string().optional()
+});
+
+export type LmStudioModelOption = z.infer<typeof lmStudioModelOptionSchema>;
+export type LmStudioModelsResponse = z.infer<typeof lmStudioModelsResponseSchema>;
 
 export const userProfileSchema = z.object({
   id: z.string().min(1),
@@ -117,6 +205,7 @@ export const repoBookSchema = z.object({
   accent: z.string(),
   progress: z.number().min(0).max(100),
   currentChapterId: z.string(),
+  generationRunId: z.string().optional(),
   parts: z.array(bookPartSchema),
   chapters: z.array(bookChapterSchema)
 });
@@ -264,12 +353,19 @@ export const postUserProfileSchema = createProfileSchema;
 export const postGenerationOutlineSchema = z.object({
   repoUrl: z.string().min(1),
   branch: z.string().default("main"),
-  model: z.string().default("qwen3-coder 14B"),
+  model: z.string().min(1).default(DEFAULT_GENERATION_MODEL),
   context: z.string().default("128k"),
-  audience: z.string().default("유지보수 가능한 junior developer"),
-  depth: z.string().default("balanced"),
+  audience: z.string().min(1).optional(),
+  readerLevel: z.enum(READER_LEVEL_VALUES).default(DEFAULT_READER_LEVEL),
+  bookPurpose: z.enum(BOOK_PURPOSE_VALUES).default(DEFAULT_BOOK_PURPOSE),
+  depth: z.enum(GENERATION_DEPTH_VALUES).default(DEFAULT_GENERATION_DEPTH),
+  customPrompt: z.string().max(4000).default(""),
   background: z.boolean().default(false)
-});
+}).transform((payload) => ({
+  ...payload,
+  audience: payload.audience ?? payload.readerLevel,
+  customPrompt: payload.customPrompt.trim()
+}));
 
 export const tutorThreadsQuerySchema = z.object({
   bookId: z.string().optional(),

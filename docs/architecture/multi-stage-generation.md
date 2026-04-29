@@ -21,6 +21,7 @@ scan/index
 
 | 단계 | 산출물 | 목적 |
 | --- | --- | --- |
+| model readiness | generation step | 선택된 LM Studio 모델을 확인하고, 없으면 `lms get <modelKey>` 후 로드 재시도 |
 | scan/index | `RepoIndex` | 파일 preview, README heading, manifest, script, dependency, symbol, route, config key, test target 추출 |
 | repository analysis | `repository_analysis` artifact | repo archetype, entry file, verification/configuration file, 핵심 흐름 후보 추출 |
 | part plan | `part_plan` artifact | 저장소 전체 arc를 4-7개 대단원으로 설계 |
@@ -34,7 +35,9 @@ scan/index
 
 ## LM Studio Integration
 
-`apps/api/src/generation/proseAdapter.ts`의 structured generation client는 내부적으로 다음 형태를 제공한다.
+`apps/api/src/lmStudioModels.ts`는 생성 화면의 모델 입력을 위해 `lms ls --llm --variants --json`을 실행하고, 결과를 짧게 cache한다. 실패 시 cached 모델이 있으면 stale 응답과 error를 함께 반환하고, cache가 없으면 빈 목록과 error를 반환해 UI가 직접 모델 ID 입력으로 fallback할 수 있게 한다.
+
+`apps/api/src/generation/proseAdapter.ts`의 structured generation client는 `@lmstudio/sdk`를 사용해 선택된 모델을 `client.llm.model(modelKey)`로 얻고, 단계별 JSON 생성을 `model.respond(..., { structured: { type: "json" } })`로 수행한다. 모델 로드가 missing/unavailable 계열 오류로 실패하면 `lms get <modelKey>`를 한 번 실행한 뒤 같은 모델을 다시 로드한다. 내부 계약은 다음 형태다.
 
 ```ts
 generateJson<T>(task, schemaName, context)
@@ -50,7 +53,7 @@ generateJson<T>(task, schemaName, context)
 - `RepoBookChapterRevision`
 - `RepoBookCoherenceReview`
 
-LM Studio가 설정되지 않은 경우에는 저장소 index와 fallback seed를 사용해 로컬 구조화 생성을 수행한다. LM Studio가 설정됐지만 단계별 section draft가 품질 검증을 통과하지 못하면 high-quality mode에서는 deterministic prose로 본문을 조용히 채우지 않는다. 해당 chapter run은 `failed`가 되고, 실패 사유와 draft artifact가 저장된다.
+대단원 계획 이후의 책 구조와 본문은 LM 응답이 필요하다. LM Studio 연결, 모델 자동 다운로드/로드, part/chapter planning이 실패하면 generation run은 실패 상태가 되며 deterministic outline으로 대체하지 않는다. 단계별 section draft가 품질 검증을 통과하지 못하면 해당 chapter run은 `failed`가 되고, 실패 사유와 draft artifact가 저장된다.
 
 ## Quality Gates
 

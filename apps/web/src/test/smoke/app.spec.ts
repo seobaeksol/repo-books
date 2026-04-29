@@ -16,7 +16,8 @@ test("desktop MVP flow", async ({ page, isMobile }) => {
   await page.getByRole("button", { name: "새 책 만들기" }).click();
   await expect(page.getByRole("heading", { name: "기술서 목차 생성" })).toBeVisible();
   await page.locator("#generation-repo").fill(process.cwd());
-  await page.getByRole("button", { name: "다시 생성" }).click();
+  await page.getByRole("button", { name: "책 생성" }).click();
+  await expect(page.getByText("생성 진행상황")).toBeVisible();
   await expect(page.getByRole("button", { name: "읽기 시작" }).first()).toBeEnabled();
   await page.getByRole("button", { name: "읽기 시작" }).first().click();
   await expect(page.locator("#reader-title")).toHaveText("제품 의도와 첫 실행 경로");

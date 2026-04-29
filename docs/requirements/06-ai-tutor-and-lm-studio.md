@@ -17,9 +17,10 @@ AI가 수행하는 핵심 작업은 다음과 같다.
 **우선순위:** P0
 
 - 시스템은 LM Studio의 로컬 모델 서버와 연동해야 한다.
-- API Base URL은 설정 가능해야 한다.
+- LM Studio SDK 연결 URL은 설정 가능해야 한다.
 - 모델 목록을 불러올 수 있으면 선택 UI를 제공한다.
 - 모델 목록을 불러오지 못하면 모델 ID를 직접 입력할 수 있어야 한다.
+- 선택한 모델이 로컬에 없으면 생성 전에 `lms get <model>` 자동 다운로드를 시도해야 한다.
 - 연결 테스트 기능을 제공해야 한다.
 - 책장 상단에는 연결 여부만 간결하게 표시한다.
 - 모델명, 컨텍스트 길이, 파일 색인 상태 같은 세부 정보는 목차 생성 화면에서 표시한다.
@@ -28,9 +29,11 @@ AI가 수행하는 핵심 작업은 다음과 같다.
 
 | 항목 | 값 |
 | --- | --- |
-| API Base URL | `http://localhost:1234/v1` |
-| API 형식 | OpenAI 호환 Chat Completions 계층 |
-| 인증 | 로컬 개발 기본값은 인증 없음 또는 더미 API Key 허용 |
+| SDK URL | `ws://127.0.0.1:1234` |
+| API 형식 | `@lmstudio/sdk` structured JSON response |
+| 모델 목록 | `lms ls --llm --variants --json` |
+| 모델 자동 준비 | `lms get <model>` |
+| 인증 | 로컬 개발 기본값은 인증 없음 |
 
 ## 저장소 분석 컨텍스트
 
@@ -60,6 +63,7 @@ AI는 저장소 전체를 한 번에 모델에 넣지 않고 단계별 컨텍스
 
 | 단계 | 입력 | 출력 |
 | --- | --- | --- |
+| model readiness | 선택한 LM Studio 모델 ID | SDK model handle 또는 `lms get` 후 재시도 결과 |
 | part plan | repo archetype, README/docs 요약, manifest, entry files, top-level responsibility map | 4-7개 Part와 학습 목적 |
 | chapter plan | Part 목적, 관련 파일 후보, 전체 책 arc | Part당 3-6개 Chapter, 핵심 질문, 범위/제외 범위 |
 | chapter brief | Chapter 계획, evidence file slice, repository analysis | 책임, 흐름, code anchor, evidence, glossary, recap |
@@ -75,7 +79,9 @@ AI는 저장소 전체를 한 번에 모델에 넣지 않고 단계별 컨텍스
 - 주요 파일 요약
 - README와 문서 요약
 - 사용자의 독자 수준
+- 책의 목적
 - 원하는 생성 깊이
+- 커스텀 프롬프트
 - 선택한 LM Studio 모델
 - 모델 컨텍스트 한계
 

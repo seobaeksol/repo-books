@@ -1,5 +1,6 @@
-import type { ChapterEvidence, ChapterFlow, ChapterGlossaryEntry, ChapterRecap, CodeAnchor } from "@repo-books/shared";
-import type { IndexedFile } from "./indexer.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { LMStudioClient } from "@lmstudio/sdk";
 
 export type ChapterProseSection = {
   eyebrow: string;
@@ -7,39 +8,11 @@ export type ChapterProseSection = {
   body: string;
 };
 
-export type ChapterProseRequest = {
-  repoName: string;
-  audience: string;
-  depth: string;
-  model: string;
-  partTitle: string;
-  chapterNumber: string;
-  chapterTitle: string;
-  subtitle: string;
-  goals: string[];
-  focus: string;
-  checkpoints: string[];
-  keyQuestion: string;
-  responsibility: string;
-  flow: ChapterFlow | null | undefined;
-  codeAnchors: CodeAnchor[];
-  evidence: ChapterEvidence[];
-  glossary: ChapterGlossaryEntry[];
-  recap: ChapterRecap;
-  files: IndexedFile[];
-  baseSections: ChapterProseSection[];
-};
-
-export interface ChapterProseAdapter {
-  readonly label: string;
-  readonly stats: ChapterProseStats;
-  expandChapterSections(request: ChapterProseRequest): Promise<ChapterProseSection[] | null>;
-}
-
 export type StructuredGenerationRequest = {
   task: string;
   schemaName: string;
   context: Record<string, unknown>;
+  model?: string;
   maxTokens?: number;
 };
 
@@ -47,6 +20,8 @@ export type StructuredGenerationClient = {
   readonly label: string;
   readonly available: boolean;
   readonly stats: ChapterProseStats;
+  readonly lastError: string | null;
+  prepareModel(model?: string, onStatus?: (detail: string) => void): Promise<void>;
   generateJson<T extends object>(request: StructuredGenerationRequest): Promise<T | null>;
 };
 
@@ -56,273 +31,243 @@ export type ChapterProseStats = {
   failed: number;
   disabled: boolean;
   mode: "deterministic" | "lm-studio";
+  modelDownloads: {
+    attempted: number;
+    succeeded: number;
+    failed: number;
+  };
 };
 
-type ChatCompletionResponse = {
-  choices?: Array<{
-    message?: {
-      content?: string;
-    };
-  }>;
+type PredictionResult = {
+  content?: string;
+  parsed?: unknown;
 };
 
-type ExpandedSectionsPayload = {
-  sections?: Array<Partial<ChapterProseSection>>;
-};
-
-const disallowedBodyPatterns = [
-  /fake\s+OpenAI-compatible/i,
-  /JSON parsing/i,
-  /이\s*테스트/i,
-  /테스트용\s*응답/i,
-  /프롬프트/i,
-  /adapter/i,
-  /충분히\s*긴\s*prose/i,
-  /모델\s*응답/i,
-  /생성기/,
-  /```/,
-  /^#{1,6}\s/m
-];
-
-export function createChapterProseAdapter(): ChapterProseAdapter {
-  const baseUrl = process.env.LM_STUDIO_BASE_URL?.trim();
-  if (!baseUrl) return deterministicProseAdapter;
-  return new LmStudioProseAdapter(baseUrl);
-}
+const execFileAsync = promisify(execFile);
 
 export function createStructuredGenerationClient(): StructuredGenerationClient {
-  const baseUrl = process.env.LM_STUDIO_BASE_URL?.trim();
-  if (!baseUrl) return unavailableStructuredClient;
-  return new LmStudioStructuredGenerationClient(baseUrl);
+  return new LmStudioSdkStructuredGenerationClient();
 }
 
-export const deterministicProseAdapter: ChapterProseAdapter = {
-  label: "deterministic scanner",
-  stats: {
-    attempted: 0,
-    succeeded: 0,
-    failed: 0,
-    disabled: false,
-    mode: "deterministic"
-  },
-  async expandChapterSections(request) {
-    return request.baseSections.map((section, index) => ({
-      ...section,
-      body: expandDeterministically(request, section, index)
-    }));
-  }
-};
-
-class LmStudioProseAdapter implements ChapterProseAdapter {
-  readonly label = "LM Studio chat completions";
-  readonly stats: ChapterProseStats = {
-    attempted: 0,
-    succeeded: 0,
-    failed: 0,
-    disabled: false,
-    mode: "lm-studio"
-  };
-  private disabled = false;
-
-  constructor(private readonly baseUrl: string) {}
-
-  async expandChapterSections(request: ChapterProseRequest): Promise<ChapterProseSection[] | null> {
-    if (this.disabled) return null;
-    this.stats.attempted += 1;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), lmStudioTimeoutMs());
-    try {
-      const response = await fetch(chatCompletionsUrl(this.baseUrl), {
-        method: "POST",
-        headers: lmStudioHeaders(),
-        body: JSON.stringify(buildChatCompletionPayload(request)),
-        signal: controller.signal
-      });
-      if (!response.ok) throw new Error(`LM_STUDIO_HTTP_${response.status}`);
-      const expanded = parseExpandedSections(await response.text(), request.baseSections);
-      if (!expanded) throw new Error("LM_STUDIO_EMPTY_PROSE");
-      this.stats.succeeded += 1;
-      return expanded;
-    } catch {
-      this.stats.failed += 1;
-      this.disabled = true;
-      this.stats.disabled = true;
-      return null;
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-}
-
-const unavailableStructuredClient: StructuredGenerationClient = {
-  label: "local deterministic planner",
-  available: false,
-  stats: {
-    attempted: 0,
-    succeeded: 0,
-    failed: 0,
-    disabled: false,
-    mode: "deterministic"
-  },
-  async generateJson() {
-    return null;
-  }
-};
-
-class LmStudioStructuredGenerationClient implements StructuredGenerationClient {
-  readonly label = "LM Studio structured generation";
+class LmStudioSdkStructuredGenerationClient implements StructuredGenerationClient {
+  readonly label = "LM Studio TypeScript SDK";
   readonly available = true;
+  lastError: string | null = null;
   readonly stats: ChapterProseStats = {
     attempted: 0,
     succeeded: 0,
     failed: 0,
     disabled: false,
-    mode: "lm-studio"
+    mode: "lm-studio",
+    modelDownloads: {
+      attempted: 0,
+      succeeded: 0,
+      failed: 0
+    }
   };
 
-  constructor(private readonly baseUrl: string) {}
+  private readonly client = new LMStudioClient(lmStudioClientOptions());
+  private readonly modelHandles = new Map<string, Promise<{ respond: (chat: unknown, opts: Record<string, unknown>) => Promise<PredictionResult> }>>();
+  private readonly modelDownloads = new Map<string, Promise<void>>();
+
+  async prepareModel(model: string | undefined, onStatus?: (detail: string) => void) {
+    const modelKey = resolveModelKey(model);
+    onStatus?.(modelKey ? `LM Studio 모델 ${modelKey} 확인 중` : "LM Studio에 로드된 기본 모델 확인 중");
+    await this.modelFor(modelKey, onStatus);
+  }
 
   async generateJson<T extends object>(request: StructuredGenerationRequest): Promise<T | null> {
     this.stats.attempted += 1;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), lmStudioTimeoutMs());
     try {
-      const response = await fetch(chatCompletionsUrl(this.baseUrl), {
-        method: "POST",
-        headers: lmStudioHeaders(),
-        body: JSON.stringify({
-          model: process.env.LM_STUDIO_MODEL?.trim() || process.env.DEFAULT_LM_STUDIO_MODEL || "qwen3-coder 14B",
-          temperature: 0.15,
-          max_tokens: request.maxTokens ?? 4096,
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are a repository-to-book planning engine. Return only valid JSON. Do not include markdown, code fences, prompts, model commentary, or unsupported repository claims."
-            },
-            {
-              role: "user",
-              content: JSON.stringify({
-                task: request.task,
-                schemaName: request.schemaName,
-                constraints: [
-                  "Use only supplied repository evidence.",
-                  "Prefer system explanation over file navigation.",
-                  "Every generated section must be grounded in file paths, symbols, routes, config keys, headings, or tests.",
-                  "Do not mention prompts, adapters, fake responses, JSON parsing, or generation internals."
-                ],
-                context: request.context
-              })
-            }
-          ]
-        }),
+      const model = await this.modelFor(resolveModelKey(request.model));
+      const result = await model.respond(buildStructuredChat(request), {
+        temperature: lmStudioTemperature(),
+        maxTokens: request.maxTokens ?? 4096,
+        structured: { type: "json" },
         signal: controller.signal
       });
-      if (!response.ok) throw new Error(`LM_STUDIO_HTTP_${response.status}`);
-      const raw = await response.text();
-      const parsed = JSON.parse(raw) as ChatCompletionResponse;
-      const content = parsed.choices?.[0]?.message?.content;
-      if (!content) throw new Error("LM_STUDIO_EMPTY_JSON");
-      const payload = JSON.parse(extractJsonObject(content)) as T;
-      if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("LM_STUDIO_JSON_OBJECT_REQUIRED");
+      const payload = parseStructuredResult<T>(result);
       this.stats.succeeded += 1;
+      this.lastError = null;
       return payload;
-    } catch {
+    } catch (error) {
       this.stats.failed += 1;
+      this.lastError = error instanceof Error ? error.message : "LM_STUDIO_SDK_ERROR";
       return null;
     } finally {
       clearTimeout(timeout);
     }
   }
+
+  private modelFor(modelKey: string, onStatus?: (detail: string) => void) {
+    const cacheKey = modelKey || "__loaded__";
+    const cached = this.modelHandles.get(cacheKey);
+    if (cached) return cached;
+    const handle = this.loadModel(modelKey, onStatus)
+      .then((model) => model as { respond: (chat: unknown, opts: Record<string, unknown>) => Promise<PredictionResult> })
+      .catch((error) => {
+        this.modelHandles.delete(cacheKey);
+        throw error;
+      });
+    this.modelHandles.set(cacheKey, handle);
+    return handle;
+  }
+
+  private async loadModel(modelKey: string, onStatus?: (detail: string) => void) {
+    try {
+      return await sdkModel(this.client, modelKey);
+    } catch (error) {
+      if (!modelKey || !shouldAutoDownloadModel(error)) throw error;
+      onStatus?.(`로컬 모델 ${modelKey}을 찾지 못해 lms get 실행 중`);
+      await this.downloadModel(modelKey);
+      onStatus?.(`로컬 모델 ${modelKey} 다운로드 완료, LM Studio 모델 로드 재시도 중`);
+      return await sdkModel(this.client, modelKey);
+    }
+  }
+
+  private downloadModel(modelKey: string) {
+    const cached = this.modelDownloads.get(modelKey);
+    if (cached) return cached;
+    this.stats.modelDownloads.attempted += 1;
+    const pending = runLmsGet(modelKey)
+      .then(() => {
+        this.stats.modelDownloads.succeeded += 1;
+      })
+      .catch((error) => {
+        this.stats.modelDownloads.failed += 1;
+        throw error;
+      })
+      .finally(() => {
+        this.modelDownloads.delete(modelKey);
+      });
+    this.modelDownloads.set(modelKey, pending);
+    return pending;
+  }
 }
 
-function buildChatCompletionPayload(request: ChapterProseRequest) {
-  return {
-    model: process.env.LM_STUDIO_MODEL?.trim() || request.model,
-    temperature: 0.2,
-    max_tokens: maxTokensForDepth(request.depth),
-    messages: [
-      {
-        role: "system",
-        content:
-          "You turn repository chapter briefs and evidence into Korean long-form technical book prose. Return only JSON with a sections array. Do not invent APIs that are not supported by supplied anchors, evidence, or files."
+function sdkModel(client: LMStudioClient, modelKey: string) {
+  const opts = lmStudioLoadOptions();
+  return Promise.resolve(modelKey ? client.llm.model(modelKey, opts) : client.llm.model());
+}
+
+function buildStructuredChat(request: StructuredGenerationRequest) {
+  return [
+    {
+      role: "system",
+      content:
+        "You are a repository-to-book generation engine. Return only valid JSON for the requested schema. Use only supplied repository evidence. Do not include markdown, code fences, prompts, model commentary, or unsupported repository claims."
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        task: request.task,
+        schemaName: request.schemaName,
+        responseShape: responseShape(request.schemaName),
+        constraints: [
+          "Return exactly one JSON object that matches responseShape.",
+          "Use only supplied repository evidence.",
+          "Every generated claim must be grounded in file paths, symbols, routes, config keys, headings, tests, or provided excerpts.",
+          "Generate the book structure and prose yourself; do not copy fallback outlines or deterministic template text.",
+          "Write Korean technical-book content unless a file path, symbol, package name, command, or API identifier must stay as-is.",
+          "Do not mention prompts, adapters, fake responses, JSON parsing, or generation internals."
+        ],
+        context: request.context
+      })
+    }
+  ];
+}
+
+function responseShape(schemaName: string) {
+  const shapes: Record<string, unknown> = {
+    RepoBookPartPlan: {
+      parts: [
+        {
+          title: "Part I. ...",
+          summary: "What this part teaches from the supplied repository evidence."
+        }
+      ]
+    },
+    RepoBookChapterPlan: {
+      chapters: [
+        {
+          title: "Chapter title",
+          subtitle: "Short technical subtitle",
+          files: ["exact/indexed/path.rs"],
+          goals: ["Reader-visible learning goal"],
+          focus: "The specific repository responsibility explained in this chapter.",
+          checkpoints: ["Question the reader can answer after the chapter"],
+          codePath: "exact/indexed/path.rs",
+          codeLabel: "Why this file is the primary code anchor"
+        }
+      ]
+    },
+    RepoBookChapterBrief: {
+      keyQuestion: "Question answered by this chapter",
+      responsibility: "Repository responsibility described with file evidence",
+      flow: {
+        type: "architecture",
+        title: "Flow title",
+        summary: "Grounded flow summary",
+        diagram: "flowchart TD\\n  A[\"file\"] --> B[\"file\"]"
       },
-      {
-        role: "user",
-        content: JSON.stringify({
-          task: "Rewrite each base section into 2-3 cohesive Korean paragraphs that explain how this repository works.",
-          constraints: [
-            "Keep the original eyebrow and title for each section.",
-            "Use the key question, responsibility, flow, codeAnchors, evidence, glossary, and checkpoints as source of truth.",
-            "Explain system behavior, module responsibility, data/control flow, and change risks. Do not explain how to read the repository.",
-            "Every important claim should mention a supplied file path, symbol, route, config key, heading, or test target.",
-            "Write narrative body text, not outline bullets.",
-            "Avoid markdown headings and code fences inside body.",
-            "Do not mention prompts, model responses, adapters, tests for this generator, JSON parsing, fake responses, or prose length."
-          ],
-          repoName: request.repoName,
-          audience: request.audience,
-          depth: request.depth,
-          partTitle: request.partTitle,
-          chapterNumber: request.chapterNumber,
-          chapterTitle: request.chapterTitle,
-          subtitle: request.subtitle,
-          goals: request.goals,
-          focus: request.focus,
-          checkpoints: request.checkpoints,
-          keyQuestion: request.keyQuestion,
-          responsibility: request.responsibility,
-          flow: request.flow,
-          codeAnchors: request.codeAnchors,
-          evidence: request.evidence,
-          glossary: request.glossary,
-          recap: request.recap,
-          files: request.files.map(fileContext),
-          baseSections: request.baseSections
-        })
+      codeAnchors: [
+        {
+          filePath: "exact/indexed/path.rs",
+          symbolName: "SymbolName",
+          lineHint: "L10",
+          claim: "Grounded claim",
+          explanation: "Why the anchor proves the claim",
+          excerptLines: ["short source excerpt"]
+        }
+      ],
+      evidence: [
+        {
+          filePath: "exact/indexed/path.rs",
+          role: "Evidence role",
+          usedAsEvidence: "How this file supports the chapter",
+          outOfScope: "What not to infer"
+        }
+      ],
+      glossary: [{ term: "Term", meaning: "Meaning in this repository", appearsIn: "exact/indexed/path.rs", relatedAnchors: ["exact/indexed/path.rs"] }],
+      recap: {
+        understood: ["What the reader now understands"],
+        changeEntryPoints: ["exact/indexed/path.rs · SymbolName"],
+        nextQuestions: ["What to inspect next"]
       }
-    ]
+    },
+    RepoBookSectionPlan: {
+      sections: [
+        {
+          eyebrow: "Section label",
+          title: "Section title",
+          purpose: "Why this section exists",
+          evidenceFiles: ["exact/indexed/path.rs"]
+        }
+      ]
+    },
+    RepoBookSectionDraft: {
+      body: "Three Korean paragraphs. Mention at least one exact evidence file path from evidenceFiles."
+    },
+    RepoBookChapterRevision: {
+      sections: [{ eyebrow: "Section label", title: "Section title", body: "Revised body that preserves exact evidence file paths." }],
+      notes: ["Coherence note"]
+    },
+    RepoBookCoherenceReview: {
+      status: "ok",
+      terminology: ["Term consistency note"],
+      missingFlows: ["Any missing flow"],
+      nextQuestionContinuity: ["Continuity note"]
+    }
   };
+  return shapes[schemaName] ?? { result: "JSON object" };
 }
 
-function fileContext(file: IndexedFile) {
-  return {
-    path: file.path,
-    kind: file.kind,
-    headings: file.headings.slice(0, 5),
-    symbols: file.symbols.slice(0, 8),
-    symbolDetails: file.symbolDetails.slice(0, 8),
-    commands: file.commands.slice(0, 8),
-    dependencies: file.dependencies.slice(0, 12),
-    features: file.features.slice(0, 12),
-    configKeys: file.configKeys.slice(0, 12),
-    routes: file.routes.slice(0, 12),
-    testTargets: file.testTargets.slice(0, 12),
-    preview: file.preview.slice(0, 1200)
-  };
-}
-
-function parseExpandedSections(raw: string, baseSections: ChapterProseSection[]) {
-  const response = JSON.parse(raw) as ChatCompletionResponse;
-  const content = response.choices?.[0]?.message?.content;
-  if (!content) return null;
-  const payload = JSON.parse(extractJsonObject(content)) as ExpandedSectionsPayload;
-  const sections = payload.sections;
-  if (!Array.isArray(sections) || sections.length !== baseSections.length) return null;
-
-  const expanded = sections.map((section, index) => {
-    const base = baseSections[index];
-    const body = typeof section.body === "string" ? section.body.trim() : "";
-    if (!base || body.length < 240) return null;
-    if (disallowedBodyPatterns.some((pattern) => pattern.test(body))) return null;
-    return {
-      eyebrow: base.eyebrow,
-      title: base.title,
-      body
-    };
-  });
-  if (expanded.some((section) => section === null)) return null;
-  return expanded as ChapterProseSection[];
+function parseStructuredResult<T extends object>(result: PredictionResult): T {
+  const parsed = result.parsed ?? JSON.parse(extractJsonObject(result.content ?? ""));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("LM_STUDIO_JSON_OBJECT_REQUIRED");
+  return parsed as T;
 }
 
 function extractJsonObject(content: string) {
@@ -334,71 +279,92 @@ function extractJsonObject(content: string) {
   return trimmed.slice(start, end + 1);
 }
 
-function expandDeterministically(request: ChapterProseRequest, section: ChapterProseSection, index: number) {
-  const files = request.files.length ? request.files : [];
-  const primaryFiles = files.slice(0, 3).map((file) => file.path);
-  const evidence = summarizeEvidence(files, request.evidence);
-  const anchors = request.codeAnchors.slice(0, 3);
-  const anchorText = anchors.map((anchor) => `${anchor.filePath}${anchor.symbolName ? `의 ${anchor.symbolName}` : ""}${anchor.lineHint ? `(${anchor.lineHint})` : ""}`).join(", ");
-  const checkpoint = request.checkpoints[index] ?? request.checkpoints[0] ?? "핵심 근거를 표시한다.";
-  const depthPhrase = request.depth === "deep" ? "세부 구현의 이유와 변경 여파까지" : request.depth === "light" ? "핵심 책임 위주로" : "구조와 근거를 균형 있게";
-
-  if (index === 0) {
-    return [
-      `${request.keyQuestion} ${request.subtitle} ${request.responsibility} 이 장의 답은 ${primaryFiles.join(", ") || request.repoName}가 맡는 책임을 하나의 시스템 설명으로 묶을 때 드러난다. ${anchorText || "제공된 코드 앵커"}는 이 책임이 문서, manifest, source, test 중 어디에서 실제 계약으로 굳어지는지 보여 준다.`,
-      `${evidence} 따라서 본문은 ${depthPhrase} 설명한다. ${request.repoName}의 이 영역은 파일 이름보다 책임 경계가 더 중요하며, public symbol, route, config key, test target이 같은 방향을 가리킬 때 독자는 구현 의도와 변경 위험을 함께 이해할 수 있다.`,
-      `${request.focus} 이 판단은 ${checkpoint}라는 확인 기준으로 닫힌다. 이 장을 마치면 ${request.goals.slice(0, 2).join(" ")}라는 목표를 저장소 내부 근거로 설명할 수 있어야 하고, 다음 장에서는 여기서 확정한 책임 경계를 더 좁은 구현 흐름으로 이어 간다.`
-    ].join("\n\n");
+async function runLmsGet(modelKey: string) {
+  const command = process.env.LM_STUDIO_LMS_BIN?.trim() || "lms";
+  try {
+    await execFileAsync(command, ["get", modelKey], {
+      timeout: lmStudioModelDownloadTimeoutMs(),
+      maxBuffer: 20 * 1024 * 1024
+    });
+  } catch (error) {
+    throw new Error(`LM_STUDIO_MODEL_DOWNLOAD_FAILED: ${command} get ${modelKey}: ${formatExecError(error)}`);
   }
-
-  if (index === 1) {
-    return [
-      `${request.flow?.title ?? section.title}는 ${request.flow?.summary ?? request.focus} ${primaryFiles.join(", ") || "제공된 파일"}가 이 흐름의 구체 근거다. 이 장에서는 각 파일을 독립 요약으로 다루지 않고, 사용자 경험이나 런타임 조건이 어떤 모듈 경계와 검증 근거를 통과하는지 설명한다.`,
-      `${evidence} 이 근거는 API 경계와 내부 구현 경계를 구분하게 해 준다. 공개 타입이나 함수는 호출자가 기대하는 안정성을 보여 주고, manifest와 config key는 기능이 활성화되는 조건을 고정하며, 테스트나 예제는 그 기대가 실제 흐름에서 보호되는 범위를 드러낸다.`,
-      `그래서 ${request.chapterTitle}의 핵심은 구현 세부를 모두 압축하는 것이 아니라 변경 전에 놓치면 위험한 전제를 앞으로 끌어오는 데 있다. ${request.recap.changeEntryPoints.slice(0, 3).join(", ") || anchorText}를 변경 진입점으로 삼으면 ownership, feature gate, 검증 책임이 어디에서 이어지는지 유지한 채 다음 구현 영역으로 넘어갈 수 있다.`
-    ].join("\n\n");
-  }
-
-  return [
-    `${request.chapterTitle}를 고치거나 디버깅할 때의 첫 판단 기준은 ${request.recap.changeEntryPoints.slice(0, 3).join(", ") || primaryFiles.join(", ")}다. 이 지점들은 ${anchors.map((anchor) => anchor.claim).join(" ")}라는 주장과 연결되어 있으므로, 변경 영향은 파일 목록이 아니라 책임과 근거의 연결로 추적해야 한다.`,
-    `${evidence} 이 근거를 기준으로 보면 ${request.audience} 독자에게 필요한 정보는 모든 파일의 축약본이 아니다. 어떤 symbol이 외부 계약을 만들고, 어떤 config key가 실행 조건을 바꾸며, 어떤 테스트가 회귀를 막는지 알 수 있어야 저장소를 열지 않아도 시스템의 작동 방식을 설명할 수 있다.`,
-    `마지막으로 ${checkpoint}를 확인하면서 장을 닫는다. ${request.recap.understood.slice(0, 3).join(" ")} 다음 질문은 ${request.recap.nextQuestions.slice(0, 2).join(" ")}이며, 이 질문이 다음 장의 책임과 연결될 때 책 전체는 파일 안내가 아니라 저장소 이해를 대체하는 기술서로 작동한다.`
-  ].join("\n\n");
 }
 
-function summarizeEvidence(files: IndexedFile[], evidenceItems: ChapterEvidence[]) {
-  const symbols = files.flatMap((file) => file.symbolDetails.slice(0, 3).map((symbol) => `${symbol.name}(${symbol.kind})`)).slice(0, 8);
-  const headings = files.flatMap((file) => file.headings.slice(0, 2)).slice(0, 5);
-  const evidence = evidenceItems.slice(0, 3).map((item) => `${item.filePath}: ${item.usedAsEvidence}`);
-  if (evidence.length > 0) return `근거는 ${evidence.join(" / ")}이다.`;
-  if (symbols.length > 0 && headings.length > 0) return `근거 symbol은 ${symbols.join(", ")}이고 문서 heading은 ${headings.join(", ")}이다.`;
-  if (symbols.length > 0) return `근거 symbol은 ${symbols.join(", ")}이다.`;
-  if (headings.length > 0) return `근거 heading은 ${headings.join(", ")}이다.`;
-  return "근거는 파일 경로, preview, 코드 excerpt가 드러내는 책임 범위다.";
+function shouldAutoDownloadModel(error: unknown) {
+  if (!lmStudioAutoDownloadEnabled()) return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return /cannot\s+find|not\s+found|missing|unavailable|not\s+available|not\s+loaded|no\s+model|does\s+not\s+exist/i.test(message);
 }
 
-function lmStudioHeaders() {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json"
-  };
-  const apiKey = process.env.LM_STUDIO_API_KEY?.trim();
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  return headers;
+function resolveModelKey(model: string | undefined) {
+  return model?.trim() || process.env.LM_STUDIO_MODEL?.trim() || process.env.DEFAULT_LM_STUDIO_MODEL?.trim() || "";
 }
 
-function chatCompletionsUrl(baseUrl: string) {
-  const trimmed = baseUrl.trim().replace(/\/$/, "");
-  return trimmed.endsWith("/v1") ? `${trimmed}/chat/completions` : `${trimmed}/v1/chat/completions`;
+function lmStudioClientOptions() {
+  const baseUrl = lmStudioSdkBaseUrl();
+  return baseUrl ? { baseUrl, verboseErrorMessages: true } : { verboseErrorMessages: true };
+}
+
+function lmStudioSdkBaseUrl() {
+  const value = process.env.LM_STUDIO_SDK_BASE_URL?.trim() || process.env.LM_STUDIO_BASE_URL?.trim();
+  if (!value) return "";
+  const withoutApiPath = value.replace(/\/(?:api\/)?v1\/?$/i, "").replace(/\/$/, "");
+  if (withoutApiPath.startsWith("http://")) return `ws://${withoutApiPath.slice("http://".length)}`;
+  if (withoutApiPath.startsWith("https://")) return `wss://${withoutApiPath.slice("https://".length)}`;
+  return withoutApiPath;
 }
 
 function lmStudioTimeoutMs() {
-  const value = Number(process.env.LM_STUDIO_TIMEOUT_MS ?? Number(process.env.LM_STUDIO_TIMEOUT_SECONDS ?? 8) * 1000);
-  if (!Number.isFinite(value) || value <= 0) return 8_000;
-  return Math.min(value, 120_000);
+  const value = Number(process.env.LM_STUDIO_TIMEOUT_MS ?? Number(process.env.LM_STUDIO_TIMEOUT_SECONDS ?? 120) * 1000);
+  if (!Number.isFinite(value) || value <= 0) return 120_000;
+  return Math.min(value, 600_000);
 }
 
-function maxTokensForDepth(depth: string) {
-  if (depth === "deep") return 2400;
-  if (depth === "light") return 1000;
-  return 1600;
+function lmStudioLoadOptions() {
+  const contextLength = lmStudioContextLength();
+  return {
+    verbose: false,
+    ...(contextLength ? { config: { contextLength } } : {})
+  };
+}
+
+function lmStudioContextLength() {
+  const value = parseContextLength(process.env.LM_STUDIO_CONTEXT_LENGTH ?? process.env.LM_STUDIO_CONTEXT ?? "32768");
+  if (!Number.isFinite(value) || value <= 0) return 32768;
+  return Math.max(4096, Math.min(131_072, value));
+}
+
+function parseContextLength(value: string) {
+  const normalized = value.trim().toLowerCase();
+  const match = normalized.match(/^(\d+(?:\.\d+)?)\s*k$/);
+  if (match?.[1]) return Math.round(Number(match[1]) * 1024);
+  return Number(normalized);
+}
+
+function lmStudioModelDownloadTimeoutMs() {
+  const value = Number(process.env.LM_STUDIO_MODEL_DOWNLOAD_TIMEOUT_MS ?? Number(process.env.LM_STUDIO_MODEL_DOWNLOAD_TIMEOUT_SECONDS ?? 30 * 60) * 1000);
+  if (!Number.isFinite(value) || value <= 0) return 30 * 60_000;
+  return Math.min(value, 120 * 60_000);
+}
+
+function lmStudioAutoDownloadEnabled() {
+  const value = process.env.LM_STUDIO_AUTO_DOWNLOAD?.trim().toLowerCase();
+  return value !== "0" && value !== "false" && value !== "off";
+}
+
+function lmStudioTemperature() {
+  const value = Number(process.env.LM_STUDIO_TEMPERATURE ?? 0.2);
+  if (!Number.isFinite(value)) return 0.2;
+  return Math.max(0, Math.min(1, value));
+}
+
+function formatExecError(error: unknown) {
+  if (!(error instanceof Error)) return String(error);
+  const details = [error.message];
+  const maybeOutput = error as Error & { stderr?: unknown; stdout?: unknown; code?: unknown };
+  if (maybeOutput.code !== undefined) details.push(`code=${String(maybeOutput.code)}`);
+  if (typeof maybeOutput.stderr === "string" && maybeOutput.stderr.trim()) details.push(maybeOutput.stderr.trim());
+  if (typeof maybeOutput.stdout === "string" && maybeOutput.stdout.trim()) details.push(maybeOutput.stdout.trim());
+  return details.join(" ");
 }

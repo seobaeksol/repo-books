@@ -10,7 +10,6 @@ export type RepoBookQualityIssue = {
 const antiMetaPatterns = [
   /fake\s+OpenAI-compatible/i,
   /JSON parsing/i,
-  /이\s*테스트/i,
   /테스트용\s*응답/i,
   /프롬프트/i,
   /adapter/i,
@@ -25,6 +24,11 @@ export function validateRepoBookQuality(book: RepoBook, index: RepoIndex): RepoB
   const sectionBodies = new Map<string, number>();
 
   for (const chapter of book.chapters) {
+    if (chapter.status === "failed") {
+      issues.push({ severity: "warning", chapterId: chapter.id, message: "Chapter generation failed and is stored for retry instead of blocking the whole book." });
+      continue;
+    }
+
     for (const path of chapter.files) {
       if (!indexedPaths.has(path)) {
         issues.push({ severity: "error", chapterId: chapter.id, message: `Chapter references a file that was not indexed: ${path}` });

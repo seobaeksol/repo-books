@@ -2,6 +2,7 @@ import type {
   BookChapter,
   BookFilter,
   GenerationRun,
+  LmStudioModelsResponse,
   ReadingState,
   RepoBook,
   TutorMessage,
@@ -18,8 +19,11 @@ export type BookWithContent = RepoBook & {
 export type GenerationInput = {
   repositoryUrl: string;
   model: string;
-  audience: string;
+  audience?: string;
+  readerLevel: string;
+  bookPurpose: string;
   depth: string;
+  customPrompt?: string;
   background?: boolean;
 };
 
@@ -43,11 +47,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const message = await response.text();
-    throw new Error(message || `Request failed: ${response.status}`);
+    throw new Error(stripAnsi(message || `Request failed: ${response.status}`));
   }
 
   return (await response.json()) as T;
 }
+
+const stripAnsi = (value: string) => value.replace(/\u001b\[[0-9;]*m/g, "");
 
 const unwrap = <T>(value: unknown, key: string): T => {
   if (value && typeof value === "object" && key in value) {
@@ -74,6 +80,7 @@ const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(reso
 
 export const api = {
   health: () => request<{ ok: boolean; service: string }>("/api/health"),
+  listLmStudioModels: (refresh = false) => request<LmStudioModelsResponse>(`/api/lm-studio/models${refresh ? "?refresh=1" : ""}`),
   listBooks: async (filter: BookFilter = "all") => unwrap<BookWithContent[]>(await request(`/api/books?filter=${filter}`), "books"),
   getBook: getBookById,
   saveReadingState: (bookId: string, payload: Partial<ReadingState>) =>
@@ -90,20 +97,24 @@ export const api = {
   getGenerationRun: async (runId: string) => normalizeGenerationResult(await request(`/api/generation/runs/${runId}`)),
   retryFailedGenerationChapters: async (runId: string) =>
     normalizeGenerationResult(await request(`/api/generation/runs/${runId}/retry-failed-chapters`, { method: "POST" })),
-  generateOutline: async (payload: GenerationInput, onUpdate?: (result: GenerationResult) => void) => {
-    const response = await request<{ generationRun?: GenerationRun; run?: GenerationRun; book?: BookWithContent | null }>("/api/generation/runs", {
+  startGenerationRun: async (payload: GenerationInput) =>
+    normalizeGenerationResult(await request<{ generationRun?: GenerationRun; run?: GenerationRun; book?: BookWithContent | null }>("/api/generation/runs", {
       method: "POST",
       body: JSON.stringify({
         repoUrl: payload.repositoryUrl,
         model: payload.model,
-        audience: payload.audience,
+        audience: payload.audience ?? payload.readerLevel,
+        readerLevel: payload.readerLevel,
+        bookPurpose: payload.bookPurpose,
         depth: payload.depth,
+        customPrompt: payload.customPrompt ?? "",
         branch: "main",
         context: payload.depth === "deep" ? "128k" : "64k",
         background: payload.background ?? true
       })
-    });
-    let result = await normalizeGenerationResult(response);
+    })),
+  generateOutline: async (payload: GenerationInput, onUpdate?: (result: GenerationResult) => void) => {
+    let result = await api.startGenerationRun(payload);
     onUpdate?.(result);
 
     while (result.run.status === "queued" || result.run.status === "running") {
@@ -112,7 +123,7 @@ export const api = {
       onUpdate?.(result);
     }
 
-    if (result.run.status === "failed") throw new Error(result.run.error || "목차 생성에 실패했습니다.");
+    if (result.run.status === "failed") throw new Error(stripAnsi(result.run.error || "목차 생성에 실패했습니다."));
     if (!result.book) throw new Error("Generation response did not include a book draft.");
     return result;
   },

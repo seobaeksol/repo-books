@@ -24,10 +24,12 @@ export function analyzeRepository(index: RepoIndex): RepositoryAnalysis {
   const entryFiles = selectEntryFiles(index);
   const configurationFiles = index.files
     .filter((file) => file.kind === "manifest" || file.configKeys.length > 0)
+    .sort(compareByRepositoryImportance)
     .map((file) => file.path)
     .slice(0, 12);
   const verificationFiles = index.files
     .filter((file) => file.kind === "test" || file.testTargets.length > 0)
+    .sort(compareByRepositoryImportance)
     .map((file) => file.path)
     .slice(0, 12);
   const flows = buildFlows(index, archetypes, entryFiles, configurationFiles, verificationFiles);
@@ -55,7 +57,7 @@ export function evidenceRole(file: IndexedFile) {
 
 function inferArchetypes(index: RepoIndex): RepositoryArchetype[] {
   const archetypes = new Set<RepositoryArchetype>();
-  if (index.signals.isEspHal) archetypes.add("embedded-hal");
+  if (index.signals.isEmbedded || index.signals.noStd) archetypes.add("embedded-hal");
   if (index.signals.isRust) archetypes.add("rust-library");
   if (index.packages.length > 1 || index.topLevelDirs.some((dir) => ["apps", "packages", "crates"].includes(dir.name))) archetypes.add("monorepo");
   if (index.files.some((file) => file.routes.length > 0 || file.path.includes("/api/"))) archetypes.add("api-service");
@@ -77,15 +79,40 @@ function selectEntryFiles(index: RepoIndex) {
     "apps/web/src/App.tsx",
     "apps/web/src/main.tsx",
     "src/lib.rs",
-    "src/main.rs",
-    "esp-hal/src/lib.rs"
+    "src/main.rs"
   ];
   const paths = new Set(index.files.map((file) => file.path));
   const entries = preferred.filter((path) => paths.has(path));
   const discovered = index.files
     .filter((file) => file.path.endsWith("/src/main.rs") || file.path.endsWith("/src/lib.rs") || file.path.endsWith("/src/app.ts") || file.path.endsWith("/src/App.tsx"))
+    .sort(compareByRepositoryImportance)
     .map((file) => file.path);
   return Array.from(new Set([...entries, ...discovered])).slice(0, 12);
+}
+
+function compareByRepositoryImportance(a: IndexedFile, b: IndexedFile) {
+  return repositoryImportanceScore(b) - repositoryImportanceScore(a) || a.path.localeCompare(b.path);
+}
+
+function repositoryImportanceScore(file: IndexedFile) {
+  let score = 0;
+  if (file.path === "README.md") score += 120;
+  if (file.path === "Cargo.toml" || file.path === "package.json") score += 110;
+  if (/^esp-hal\/(?:README\.md|Cargo\.toml|src\/lib\.rs)$/.test(file.path)) score += 105;
+  if (/^esp-hal\/src\/(?:gpio|clock|dma|interrupt|peripherals|soc|system|timer|uart|spi|i2c|rmt|rtc_cntl|psram)\b/.test(file.path)) score += 90;
+  if (/^[^/]+\/src\/lib\.rs$/.test(file.path)) score += 70;
+  if (/^[^/]+\/(?:README\.md|Cargo\.toml)$/.test(file.path)) score += 62;
+  if (file.path.startsWith("examples/README.md") || file.path.startsWith("examples/hello_world/")) score += 58;
+  if (file.path.startsWith("hil-test/") || file.path.startsWith("qa-test/")) score += 45;
+  if (file.kind === "readme") score += 35;
+  if (file.kind === "manifest") score += 30;
+  if (file.kind === "rust") score += 25;
+  if (file.symbolDetails.length > 0) score += 18;
+  if (file.features.length > 0 || file.dependencies.length > 0) score += 12;
+  if (file.testTargets.length > 0) score += 12;
+  if (file.path.startsWith(".github/")) score -= 45;
+  if (file.path.startsWith("compile-tests/")) score -= 15;
+  return score;
 }
 
 function buildFlows(

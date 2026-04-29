@@ -25,12 +25,14 @@ import {
   type TutorThread,
   type UIState,
   type UserProfile,
+  postGenerationOutlineSchema,
   seedBooks,
   seedUiState
 } from "@repo-books/shared";
 import { buildRepoIndex } from "./generation/indexer.js";
+import { createStructuredGenerationClient } from "./generation/proseAdapter.js";
 import { generationSteps, synthesizeRepoBook, type SynthesisHooks } from "./generation/synthesizer.js";
-import { materializeRepository } from "./generation/source.js";
+import { materializeRepository, repositorySlugFromUrl, slugify } from "./generation/source.js";
 
 type SqliteDatabase = Database.Database;
 type Row = Record<string, unknown>;
@@ -417,6 +419,14 @@ export const createRepository = (db: SqliteDatabase) => {
     WHERE id = @id
   `);
 
+  const updateGeneratingBook = db.prepare(`
+    UPDATE books SET
+      updated = @updated,
+      status_label = @statusLabel,
+      progress = @progress
+    WHERE id = @bookId AND status = 'generating'
+  `);
+
   const insertGenerationChapterRun = db.prepare(`
     INSERT INTO generation_chapter_runs (
       id, run_id, chapter_id, sort_order, title, status, attempts, source, last_error, updated_at
@@ -467,7 +477,7 @@ export const createRepository = (db: SqliteDatabase) => {
 
   const getBook = (bookId: string, userId = defaultUserId): RepoBook | null => {
     const book = getBaseBook(bookId);
-    return book ? applyUserReadingState(book, userId) : null;
+    return book ? attachGenerationRunId(applyUserReadingState(book, userId)) : null;
   };
 
   const listBooks = (filter: BookFilter, userId = defaultUserId): RepoBook[] => {
@@ -477,7 +487,7 @@ export const createRepository = (db: SqliteDatabase) => {
       : db.prepare("SELECT * FROM books ORDER BY rowid").all();
     return rows.map((row) => {
       const bookId = asString((row as Row).id);
-      return applyUserReadingState(mapBook(row as Row, getParts(bookId), getChapters(bookId)), userId);
+      return attachGenerationRunId(applyUserReadingState(mapBook(row as Row, getParts(bookId), getChapters(bookId)), userId));
     });
   };
 
@@ -551,10 +561,11 @@ export const createRepository = (db: SqliteDatabase) => {
   const createGenerationRun = async (payload: PostGenerationOutlinePayload, userId = defaultUserId): Promise<{ generationRun: GenerationRun; book: RepoBook | null }> => {
     ensureUser(userId);
     const timestamp = nowIso();
+    const bookId = `generated-${slugify(repositorySlugFromUrl(payload.repoUrl))}-${timestamp.replace(/[^0-9]/g, "").slice(0, 14)}-${randomUUID().slice(0, 8)}`;
     const run: GenerationRun = {
       id: randomUUID(),
       userId,
-      bookId: null,
+      bookId,
       repoUrl: payload.repoUrl,
       branch: payload.branch,
       model: payload.model,
@@ -569,21 +580,32 @@ export const createRepository = (db: SqliteDatabase) => {
       createdAt: timestamp,
       updatedAt: timestamp
     };
-    insertGenerationRun.run({
-      ...run,
-      stepsJson: json(run.steps),
-      outlineJson: json(run.outline),
-      payloadJson: json(payload)
+    const placeholder = createGeneratingBook(payload, bookId, run.id);
+    const createRun = db.transaction(() => {
+      saveBook(placeholder);
+      insertGenerationRun.run({
+        ...run,
+        stepsJson: json(run.steps),
+        outlineJson: json(run.outline),
+        payloadJson: json(payload)
+      });
     });
+    createRun();
 
     if (payload.background) {
       setTimeout(() => {
         void processGenerationRun(run.id).catch(() => undefined);
       }, 0);
-      return { generationRun: run, book: null };
+      return { generationRun: run, book: attachGenerationRunId(placeholder) };
     }
 
-    return await processGenerationRun(run.id, userId);
+    try {
+      return await processGenerationRun(run.id, userId);
+    } catch {
+      const failedRun = getGenerationRun(run.id);
+      if (failedRun) return { generationRun: failedRun, book: failedRun.bookId ? getBook(failedRun.bookId, failedRun.userId) : null };
+      throw new Error("GENERATION_RUN_NOT_FOUND");
+    }
   };
 
   const getGenerationRun = (runId: string): GenerationRun | null => {
@@ -604,7 +626,7 @@ export const createRepository = (db: SqliteDatabase) => {
       .all(runId)
       .map((row) => mapGenerationArtifact(row as Row));
 
-  const retryFailedGenerationChapters = (runId: string): { generationRun: GenerationRun; book: RepoBook | null; retried: number } => {
+  const retryFailedGenerationChapters = async (runId: string): Promise<{ generationRun: GenerationRun; book: RepoBook | null; retried: number }> => {
     const run = getGenerationRun(runId);
     if (!run) throw new Error("GENERATION_RUN_NOT_FOUND");
     if (run.status === "queued" || run.status === "running") throw new Error("GENERATION_RUN_BUSY");
@@ -612,50 +634,11 @@ export const createRepository = (db: SqliteDatabase) => {
     const failedChapters = run.chapterRuns.filter((chapter) => chapter.status === "failed");
     if (failedChapters.length === 0) return { generationRun: run, book: run.bookId ? getBook(run.bookId, run.userId) : null, retried: 0 };
 
-    const timestamp = nowIso();
-    const book = run.bookId ? getBook(run.bookId, run.userId) : null;
-    const repairedBook = book ? repairBookChapters(book, new Set(failedChapters.map((chapter) => chapter.chapterId))) : null;
-    const retry = db.transaction(() => {
-      if (repairedBook) saveBook(repairedBook);
-      for (const [index, chapter] of failedChapters.entries()) {
-        db.prepare(
-          `UPDATE generation_chapter_runs SET
-            status = 'complete',
-            attempts = attempts + 1,
-            source = 'chapter repair retry',
-            last_error = NULL,
-            updated_at = ?
-           WHERE id = ?`
-        ).run(timestamp, chapter.id);
-        insertGenerationArtifact.run({
-          id: randomUUID(),
-          runId,
-          chapterId: chapter.chapterId,
-          kind: "chapter_retry_repair",
-          order: run.artifacts.length + index,
-          payloadJson: json({ title: chapter.title, repairedAt: timestamp, source: "retry-failed-chapters" }),
-          createdAt: timestamp
-        });
-      }
-      const current = getGenerationRun(runId);
-      if (!current) throw new Error("GENERATION_RUN_NOT_FOUND");
-      updateGenerationRunRecord({
-        ...current,
-        status: "complete",
-        progress: 100,
-        steps: current.steps.map((step) => (step.label === "챕터 수리" ? { ...step, state: "complete", detail: `${failedChapters.length} failed chapters repaired from stored evidence` } : step)),
-        error: "",
-        updatedAt: timestamp
-      });
-    });
-    retry();
-
-    const updated = getGenerationRun(runId);
-    if (!updated) throw new Error("GENERATION_RUN_NOT_FOUND");
-    return { generationRun: updated, book: updated.bookId ? getBook(updated.bookId, updated.userId) : null, retried: failedChapters.length };
+    const result = await processGenerationRun(runId, run.userId);
+    return { ...result, retried: failedChapters.length };
   };
 
-  const retryGenerationChapter = (runId: string, chapterId: string): { generationRun: GenerationRun; book: RepoBook | null; retried: number } => {
+  const retryGenerationChapter = async (runId: string, chapterId: string): Promise<{ generationRun: GenerationRun; book: RepoBook | null; retried: number }> => {
     const run = getGenerationRun(runId);
     if (!run) throw new Error("GENERATION_RUN_NOT_FOUND");
     if (run.status === "queued" || run.status === "running") throw new Error("GENERATION_RUN_BUSY");
@@ -663,60 +646,20 @@ export const createRepository = (db: SqliteDatabase) => {
     const chapter = run.chapterRuns.find((item) => item.chapterId === chapterId);
     if (!chapter) throw new Error("CHAPTER_RUN_NOT_FOUND");
 
-    const timestamp = nowIso();
-    const book = run.bookId ? getBook(run.bookId, run.userId) : null;
-    const repairedBook = book ? repairBookChapters(book, new Set([chapterId])) : null;
-    const retry = db.transaction(() => {
-      if (repairedBook) saveBook(repairedBook);
-      db.prepare(
-        `UPDATE generation_chapter_runs SET
-          status = 'complete',
-          attempts = attempts + 1,
-          source = 'chapter repair retry',
-          last_error = NULL,
-          updated_at = ?
-         WHERE id = ?`
-      ).run(timestamp, chapter.id);
-      insertGenerationArtifact.run({
-        id: randomUUID(),
-        runId,
-        chapterId,
-        kind: "chapter_retry_repair",
-        order: run.artifacts.length,
-        payloadJson: json({ title: chapter.title, repairedAt: timestamp, source: "chapter-retry" }),
-        createdAt: timestamp
-      });
-
-      const current = getGenerationRun(runId);
-      if (!current) throw new Error("GENERATION_RUN_NOT_FOUND");
-      const remainingFailures = current.chapterRuns.filter((item) => item.chapterId !== chapterId && item.status === "failed").length;
-      updateGenerationRunRecord({
-        ...current,
-        status: remainingFailures === 0 ? "complete" : current.status,
-        progress: remainingFailures === 0 ? 100 : current.progress,
-        steps: current.steps.map((step) => (step.label === "챕터 수리" ? { ...step, state: remainingFailures === 0 ? "complete" : step.state, detail: `${chapter.title} repaired from stored evidence` } : step)),
-        error: remainingFailures === 0 ? "" : current.error,
-        updatedAt: timestamp
-      });
-    });
-    retry();
-
-    const updated = getGenerationRun(runId);
-    if (!updated) throw new Error("GENERATION_RUN_NOT_FOUND");
-    return { generationRun: updated, book: updated.bookId ? getBook(updated.bookId, updated.userId) : null, retried: 1 };
+    const result = await processGenerationRun(runId, run.userId);
+    return { ...result, retried: 1 };
   };
 
   const processGenerationRun = async (runId: string, fallbackUserId = defaultUserId): Promise<{ generationRun: GenerationRun; book: RepoBook | null }> => {
     const row = db.prepare("SELECT * FROM generation_runs WHERE id = ?").get(runId) as Row | undefined;
     if (!row) throw new Error("GENERATION_RUN_NOT_FOUND");
     const userId = asString(row.user_id) || fallbackUserId;
-    const payload = parseJson<PostGenerationOutlinePayload>(row.payload_json, {
+    const payload = postGenerationOutlineSchema.parse({
       repoUrl: asString(row.repo_url),
       branch: asString(row.branch),
       model: asString(row.model),
       context: asString(row.context),
-      audience: "유지보수 가능한 junior developer",
-      depth: "balanced",
+      ...parseJson<Partial<PostGenerationOutlinePayload>>(row.payload_json, {}),
       background: false
     });
     const startedAt = nowIso();
@@ -757,10 +700,22 @@ export const createRepository = (db: SqliteDatabase) => {
     };
 
     try {
+      const generationClient = createStructuredGenerationClient();
+      updateStage("모델 준비", `LM Studio 모델 ${payload.model} 확인 중`, 8);
+      await generationClient.prepareModel(payload.model, (detail) => updateStage("모델 준비", detail, 8));
       updateStage("저장소 분석", "materializing repository and building index", 12);
       const source = materializeRepository(payload.repoUrl, payload.branch);
       const index = buildRepoIndex(source);
-      const { book, outline, prose, chapterProse } = await synthesizeRepoBook(payload, index, { onStage: updateStage, onArtifact: saveArtifact });
+      const { book, outline, prose, chapterProse } = await synthesizeRepoBook(
+        payload,
+        index,
+        {
+          onStage: updateStage,
+          onArtifact: saveArtifact,
+          structuredGenerationClient: generationClient
+        },
+        startingRun.bookId ?? undefined
+      );
       const timestamp = nowIso();
       const chapterRuns: GenerationChapterRun[] = chapterProse.map((chapter) => ({
         id: randomUUID(),
@@ -813,7 +768,7 @@ export const createRepository = (db: SqliteDatabase) => {
         ...current,
         status: "failed",
         progress: Math.max(current.progress, 10),
-        steps: current.steps.map((step, index) => (index === 0 ? { ...step, state: "failed", detail: errorMessage(error) } : step)),
+        steps: markActiveGenerationStepFailed(current.steps, errorMessage(error)),
         error: errorMessage(error),
         updatedAt: failedAt
       });
@@ -827,6 +782,14 @@ export const createRepository = (db: SqliteDatabase) => {
       stepsJson: json(run.steps),
       outlineJson: json(run.outline)
     });
+    if (run.bookId && run.status !== "complete") {
+      updateGeneratingBook.run({
+        bookId: run.bookId,
+        updated: run.status === "failed" ? "생성 실패" : "생성 중",
+        statusLabel: generationBookStatusLabel(run),
+        progress: run.progress
+      });
+    }
   };
 
   const listTutorThreads = (filters: { bookId?: string; chapterId?: string }, userId = defaultUserId): TutorThread[] => {
@@ -1096,6 +1059,41 @@ export const createRepository = (db: SqliteDatabase) => {
       currentChapterId: asString(state.chapter_id),
       progress: asNumber(state.progress_percent)
     };
+  }
+
+  function attachGenerationRunId(book: RepoBook): RepoBook {
+    if (book.status !== "generating") return book;
+    const row = db.prepare("SELECT id FROM generation_runs WHERE book_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(book.id) as Row | undefined;
+    return row ? { ...book, generationRunId: asString(row.id) } : book;
+  }
+
+  function createGeneratingBook(payload: PostGenerationOutlinePayload, bookId: string, runId: string): RepoBook {
+    const repoSlug = repositorySlugFromUrl(payload.repoUrl);
+    const repoName = repoSlug.split("/").pop() || "repository";
+    return {
+      id: bookId,
+      title: `${repoName} Repo Book`,
+      subtitle: `${payload.readerLevel} 독자를 위해 ${payload.bookPurpose} 목적으로 생성 중`,
+      repo: repoSlug,
+      branch: payload.branch,
+      model: `LM Studio SDK · ${payload.model}`,
+      updated: "생성 대기 중",
+      status: "generating",
+      statusLabel: "생성 대기 중",
+      accent: "amber",
+      progress: 0,
+      currentChapterId: "",
+      generationRunId: runId,
+      parts: [],
+      chapters: []
+    };
+  }
+
+  function generationBookStatusLabel(run: GenerationRun) {
+    if (run.status === "failed") return "생성 실패";
+    if (run.status === "queued") return "생성 대기 중";
+    const active = currentGenerationStepLabel(run.steps);
+    return active ? `${active} 중` : "생성 중";
   }
 
   function ensureUserState(userId: string) {
@@ -1403,69 +1401,8 @@ const mapSyncStatus = (row: Row): SyncStatus => ({
   updatedAt: asString(row.updated_at)
 });
 
-const repairBookChapters = (book: RepoBook, chapterIds: Set<string>): RepoBook => ({
-  ...book,
-  chapters: book.chapters.map((chapter) =>
-    chapterIds.has(chapter.id)
-      ? {
-          ...chapter,
-          status: chapter.id === book.currentChapterId ? "current" : "draft",
-          estimatedMinutes: Math.max(chapter.estimatedMinutes, 28),
-          sections: repairChapterSections(chapter)
-        }
-      : chapter
-  )
-});
-
-const repairChapterSections = (chapter: BookChapter): BookChapter["sections"] => {
-  const evidencePaths = Array.from(
-    new Set([...(chapter.evidence ?? []).map((item) => item.filePath), ...(chapter.codeAnchors ?? []).map((anchor) => anchor.filePath), ...chapter.files].filter(Boolean))
-  );
-  const primaryFiles = evidencePaths.length ? evidencePaths : ["README.md"];
-  const anchors = chapter.codeAnchors?.length
-    ? chapter.codeAnchors
-    : primaryFiles.map((filePath) => ({
-        filePath,
-        symbolName: "",
-        lineHint: "",
-        claim: `${chapter.title}의 책임 근거`,
-        explanation: "저장된 챕터 근거에서 복구한 코드 앵커",
-        excerptLines: []
-      }));
-  const recap = chapter.recap ?? {
-    understood: chapter.goals,
-    changeEntryPoints: primaryFiles.slice(0, 3),
-    nextQuestions: chapter.checkpoints
-  };
-  const specs = [
-    ["핵심 질문", chapter.keyQuestion || `${chapter.title}는 저장소에서 어떤 책임을 맡는가`, "챕터의 질문을 저장소 책임으로 고정한다."],
-    ["책임 경계", `${chapter.title}의 시스템 책임`, chapter.responsibility || chapter.subtitle],
-    ["흐름", chapter.flow?.title || `${chapter.title}의 실행 흐름`, chapter.flow?.summary || "관련 모듈과 설정이 어떤 순서로 맞물리는지 설명한다."],
-    ["핵심 구현", "코드 앵커가 증명하는 구현 계약", "파일 근거와 공개 symbol을 통해 본문 단정을 검증한다."],
-    ["변경 판단", `${chapter.title}를 변경할 때의 영향 범위`, "수정 전에 확인할 진입점, 설정, 테스트를 연결한다."],
-    ["Recap", "다음 장으로 넘겨야 할 질문", "이 장에서 이해한 내용과 다음 판단 기준을 정리한다."]
-  ];
-
-  return specs.map(([eyebrow, title, purpose], index) => {
-    const anchor = anchors[index % anchors.length];
-    const start = index % Math.max(1, primaryFiles.length);
-    const files = primaryFiles.slice(start, start + 3);
-    const visibleFiles = files.length ? files : primaryFiles.slice(0, 3);
-    const nextQuestion = recap.nextQuestions[index % Math.max(1, recap.nextQuestions.length)] ?? chapter.checkpoints[index % Math.max(1, chapter.checkpoints.length)] ?? chapter.goals[0] ?? chapter.title;
-    const changeEntry = recap.changeEntryPoints[index % Math.max(1, recap.changeEntryPoints.length)] ?? visibleFiles[0];
-    return {
-      eyebrow,
-      title,
-      body: [
-        `${purpose} ${chapter.keyQuestion || chapter.subtitle}라는 질문은 ${chapter.title}를 파일 묶음이 아니라 ${chapter.responsibility || chapter.subtitle}라는 저장소 책임으로 이해하게 만든다. ${visibleFiles.join(", ")}는 이 책임이 실제 코드와 문서에 걸쳐 분산되어 있음을 보여 주는 근거다.`,
-        `${anchor.filePath}${anchor.symbolName ? `의 ${anchor.symbolName}` : ""}는 ${anchor.claim}을 보여 준다. 이 근거는 ${anchor.explanation} 때문에 중요하며, 독자는 이 절만으로도 어떤 파일이 공개 계약을 만들고 어떤 파일이 변경 위험을 받는지 설명할 수 있다.`,
-        `변경 시에는 ${changeEntry}를 먼저 확인하고, ${nextQuestion}라는 질문으로 영향 범위를 다시 점검한다. 이 절의 결론은 ${recap.understood.slice(0, 2).join(", ") || chapter.goals.join(", ")}이며, 다음 절에서는 같은 근거를 더 구체적인 실행 흐름이나 검증 기준으로 좁힌다.`
-      ].join("\n\n")
-    };
-  });
-};
-
 const generationStageDefaults = [
+  ["모델 준비", "waiting for LM Studio model readiness"],
   ["저장소 분석", "waiting for repository scan and index"],
   ["대단원 설계", "waiting for part plan"],
   ["소단원 설계", "waiting for chapter plan"],
@@ -1478,7 +1415,7 @@ const generationStageDefaults = [
 const pendingGenerationSteps = (): GenerationRun["steps"] =>
   generationStageDefaults.map(([label, detail]) => ({ label, state: "pending", detail }));
 
-const runningGenerationSteps = (): GenerationRun["steps"] => stagedGenerationSteps("저장소 분석", "materializing repository");
+const runningGenerationSteps = (): GenerationRun["steps"] => stagedGenerationSteps("모델 준비", "checking LM Studio model");
 
 const stagedGenerationSteps = (activeLabel: string, activeDetail: string): GenerationRun["steps"] => {
   const activeIndex = Math.max(0, generationStageDefaults.findIndex(([label]) => label === activeLabel));
@@ -1490,3 +1427,12 @@ const stagedGenerationSteps = (activeLabel: string, activeDetail: string): Gener
 };
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : "UNKNOWN_ERROR");
+
+const markActiveGenerationStepFailed = (steps: GenerationRun["steps"], detail: string): GenerationRun["steps"] => {
+  const activeIndex = steps.findIndex((step) => step.state === "active");
+  const failedIndex = activeIndex >= 0 ? activeIndex : 0;
+  return steps.map((step, index) => (index === failedIndex ? { ...step, state: "failed", detail } : step));
+};
+
+const currentGenerationStepLabel = (steps: GenerationRun["steps"]) =>
+  steps.find((step) => step.state === "active" || step.state === "failed")?.label ?? [...steps].reverse().find((step) => step.state === "complete")?.label ?? "";
