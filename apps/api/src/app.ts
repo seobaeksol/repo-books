@@ -51,6 +51,7 @@ export const createApp = async (options: CreateAppOptions = {}): Promise<RepoBoo
   app.decorate("repo", repo);
 
   if (options.seed ?? true) repo.seedIfEmpty();
+  repo.recoverInterruptedGenerationRuns();
 
   await app.register(cors, { origin: true });
 

@@ -130,6 +130,30 @@ const generatingBook = {
   chapters: []
 };
 
+const partialGeneratingBook = {
+  ...generatingBook,
+  id: "generated-partial-book",
+  title: "partial-service Repo Book",
+  statusLabel: "생성 중단 · 일부 읽기 가능",
+  progress: 61,
+  currentChapterId: "partial-chapter-1-1",
+  generationRunId: "run-partial",
+  parts: [{ id: "partial-part-1", bookId: "generated-partial-book", order: 0, title: "Part I. 부분 원고", summary: "완성된 챕터부터 먼저 읽습니다." }],
+  chapters: [
+    {
+      ...book.chapters[0],
+      id: "partial-chapter-1-1",
+      bookId: "generated-partial-book",
+      partId: "partial-part-1",
+      number: "1.1",
+      title: "부분 생성된 첫 장",
+      subtitle: "생성 중 먼저 완성된 챕터입니다.",
+      status: "current",
+      progress: 0
+    }
+  ]
+};
+
 const uiState = {
   id: "default",
   activeBookId: "repo-books-book",
@@ -302,6 +326,54 @@ beforeEach(() => {
           book: generatingBook
         });
       }
+      if (url.startsWith("/api/generation/runs/run-partial")) {
+        return json({
+          generationRun: {
+            id: "run-partial",
+            userId: "local",
+            bookId: partialGeneratingBook.id,
+            repoUrl: partialGeneratingBook.repo,
+            branch: "main",
+            model: DEFAULT_GENERATION_MODEL,
+            context: "64k",
+            status: "failed",
+            progress: 61,
+            steps: [
+              { label: "모델 준비", state: "complete", detail: "complete" },
+              { label: "저장소 분석", state: "complete", detail: "complete" },
+              { label: "대단원 설계", state: "complete", detail: "complete" },
+              { label: "소단원 설계", state: "complete", detail: "complete" },
+              { label: "근거 수집", state: "complete", detail: "complete" },
+              { label: "본문 생성", state: "failed", detail: "서버가 재시작되어 백그라운드 책 생성 작업이 중단되었습니다." },
+              { label: "챕터 수리", state: "pending", detail: "waiting for revision pass" },
+              { label: "책 일관성 점검", state: "pending", detail: "waiting for coherence pass" }
+            ],
+            outline: [],
+            chapterRuns: [],
+            artifacts: [
+              {
+                id: "partial-artifact",
+                runId: "run-partial",
+                chapterId: partialGeneratingBook.chapters[0].id,
+                kind: "chapter_revision",
+                order: 0,
+                payload: { chapterNumber: "1.1", title: "부분 생성된 첫 장", status: "drafted" },
+                createdAt: uiState.updatedAt
+              }
+            ],
+            error: "서버가 재시작되어 백그라운드 책 생성 작업이 중단되었습니다.",
+            createdAt: uiState.updatedAt,
+            updatedAt: uiState.updatedAt
+          },
+          book: partialGeneratingBook
+        });
+      }
+      if (url.startsWith("/api/books/generated-partial-book")) {
+        return json({
+          book: partialGeneratingBook,
+          readingState: { bookId: partialGeneratingBook.id, chapterId: partialGeneratingBook.currentChapterId, progressPercent: 0, scrollY: 0, updatedAt: uiState.updatedAt }
+        });
+      }
       if (url.startsWith("/api/books/")) return json({ book, readingState: { bookId: book.id, chapterId: book.currentChapterId, progressPercent: 62, scrollY: 0, updatedAt: uiState.updatedAt } });
       if (url.startsWith("/api/books?filter=generating")) return json({ books: [generatingBook] });
       if (url.startsWith("/api/books?filter=draft")) return json({ books: [] });
@@ -433,6 +505,26 @@ describe("Repo Books web app", () => {
     expect(screen.getByLabelText("생성 실행 시간 정보")).toHaveTextContent("마지막 갱신");
     expect(screen.getByText("최근 생성 활동")).toBeInTheDocument();
     expect(screen.getByText("Repo Books coherence")).toBeInTheDocument();
+  });
+
+  it("allows reading partial chapters from an interrupted generation run", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/generation/runs/run-partial"]}>
+        <App />
+      </MemoryRouter>
+    );
+
+    expect(await screen.findByText("생성 실패")).toBeInTheDocument();
+    expect(screen.getByText("생성 중단 · 일부 읽기 가능")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /부분 생성된 첫 장/ })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: "부분 읽기" }));
+
+    expect(await screen.findByRole("heading", { name: "부분 생성된 첫 장" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith("/api/books/generated-partial-book", expect.anything());
+    });
   });
 
   it("loads available LM Studio model variants into the generation form", async () => {

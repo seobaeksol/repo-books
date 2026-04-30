@@ -1095,7 +1095,9 @@ function GenerationProgressRoute({
   const running = result?.run.status === "queued" || result?.run.status === "running";
   const failedChapterCount = result?.run.chapterRuns?.filter((chapter) => chapter.status === "failed").length ?? 0;
   const canRetryFailedChapters = Boolean(result?.run.id) && failedChapterCount > 0 && !running && !retrying;
-  const canReadBook = Boolean(displayBook?.chapters?.length && result?.run.status === "complete" && !retrying);
+  const readableChapter = firstReadableChapter(displayBook);
+  const canReadBook = Boolean(displayBook?.chapters?.length && readableChapter && !retrying);
+  const readActionLabel = result?.run.status === "complete" ? "읽기 시작" : "부분 읽기";
   const displaySteps: GenerationStep[] =
     result?.run.steps ??
     GENERATION_STEPS.map((step) => ({
@@ -1174,11 +1176,11 @@ function GenerationProgressRoute({
         <button
           className="primary-action"
           type="button"
-          onClick={() => displayBook && onReadBook(displayBook.id, displayBook.currentChapterId ?? firstChapter(displayBook)?.id)}
+          onClick={() => displayBook && onReadBook(displayBook.id, readableChapter?.id ?? displayBook.currentChapterId ?? firstChapter(displayBook)?.id)}
           disabled={!canReadBook}
         >
           <BookOpenCheck />
-          <span>읽기 시작</span>
+          <span>{readActionLabel}</span>
         </button>
       </div>
 
@@ -1240,7 +1242,7 @@ function GenerationProgressRoute({
             </div>
             <div>
               <dt>Output</dt>
-              <dd>{result?.run.status === "complete" ? "book draft" : "generating book"}</dd>
+              <dd>{result?.run.status === "complete" ? "book draft" : displayBook?.chapters?.length ? "partial draft" : "generating book"}</dd>
             </div>
           </dl>
         </aside>
@@ -1253,7 +1255,11 @@ function GenerationProgressRoute({
             </div>
             <span className="outline-confidence">
               <span className="state-dot state-dot--ready" />
-              {result?.run.status === "complete" ? "indexed coherent" : generationStatusLabel(result?.run.status ?? "queued")}
+              {result?.run.status === "complete"
+                ? "indexed coherent"
+                : displayBook?.chapters?.length
+                  ? statusLabel(displayBook)
+                  : generationStatusLabel(result?.run.status ?? "queued")}
             </span>
           </div>
           <OutlinePreview book={displayBook} onReadBook={onReadBook} />
@@ -1366,12 +1372,17 @@ function OutlinePreview({ book, onReadBook }: { book: BookWithContent | null; on
             <ol>
               {chapters.map((chapter) => (
                 <li key={chapter.id}>
-                  <button type="button" onClick={() => onReadBook(book.id, chapter.id)}>
+                  <button
+                    className={hasReadableChapter(chapter) ? "" : "is-pending"}
+                    type="button"
+                    onClick={() => onReadBook(book.id, chapter.id)}
+                    disabled={!hasReadableChapter(chapter)}
+                  >
                     <span>
                       {chapter.number} {chapter.title}
                     </span>
                     <small>
-                      {relatedFiles(chapter).length || 2} files · {chapter.estimatedMinutes} min
+                      {chapterStatusLabel(chapter)} · {relatedFiles(chapter).length || 2} files · {chapter.estimatedMinutes} min
                     </small>
                   </button>
                 </li>
@@ -2047,6 +2058,16 @@ function firstChapter(book: BookWithContent | null | undefined) {
   return book?.chapters?.[0];
 }
 
+function firstReadableChapter(book: BookWithContent | null | undefined) {
+  if (!book?.chapters?.length) return undefined;
+  const current = book.chapters.find((chapter) => chapter.id === book.currentChapterId && hasReadableChapter(chapter));
+  return current ?? book.chapters.find(hasReadableChapter);
+}
+
+function hasReadableChapter(chapter: BookChapter) {
+  return Boolean(chapter.sections?.some((section) => section.body.trim().length > 0));
+}
+
 function progress(book: BookWithContent) {
   return clampPercent(Number(getNumber(book, "progressPercent") ?? getNumber(book, "progress") ?? 0));
 }
@@ -2099,6 +2120,19 @@ function recentSortKey(book: BookWithContent) {
 
 function statusLabel(book: BookWithContent) {
   return getString(book, "statusLabel") || STATUS_LABELS[book.status] || book.status;
+}
+
+function chapterStatusLabel(chapter: BookChapter) {
+  const labels: Record<string, string> = {
+    complete: "생성됨",
+    current: "읽는 중",
+    generating: "작성 중",
+    draft: "초안",
+    failed: "실패",
+    next: "다음",
+    locked: "대기"
+  };
+  return labels[chapter.status] ?? chapter.status;
 }
 
 function coverTheme(book: BookWithContent) {

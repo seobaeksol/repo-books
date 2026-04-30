@@ -58,6 +58,8 @@ const asNumber = (value: unknown) => Number(value ?? 0);
 
 export const defaultUserId = "local";
 const syncSchemaVersion = 1;
+const interruptedGenerationMessage =
+  "서버가 재시작되어 백그라운드 책 생성 작업이 중단되었습니다. 이미 만들어진 챕터는 부분 원고로 읽을 수 있습니다.";
 
 const defaultUserProfile = (): UserProfile => ({
   id: defaultUserId,
@@ -476,11 +478,13 @@ export const createRepository = (db: SqliteDatabase) => {
   };
 
   const getBook = (bookId: string, userId = defaultUserId): RepoBook | null => {
+    materializePartialBookForBook(bookId);
     const book = getBaseBook(bookId);
     return book ? attachGenerationRunId(applyUserReadingState(book, userId)) : null;
   };
 
   const listBooks = (filter: BookFilter, userId = defaultUserId): RepoBook[] => {
+    materializePartialBooksForActiveRuns();
     const statusFilter = filter === "in_progress" ? "reading" : filter === "all" ? null : filter;
     const rows = statusFilter
       ? db.prepare("SELECT * FROM books WHERE status = ? ORDER BY rowid").all(statusFilter)
@@ -513,6 +517,7 @@ export const createRepository = (db: SqliteDatabase) => {
 
   const saveReadingState = (bookId: string, payload: PatchReadingStatePayload, userId = defaultUserId): ReadingState => {
     ensureUser(userId);
+    materializePartialBookForBook(bookId);
     const book = getBaseBook(bookId);
     if (!book) throw new Error("BOOK_NOT_FOUND");
     if (!book.chapters.some((chapter) => chapter.id === payload.chapterId)) throw new Error("CHAPTER_NOT_FOUND");
@@ -685,6 +690,7 @@ export const createRepository = (db: SqliteDatabase) => {
         createdAt: nowIso()
       });
       artifactOrder += 1;
+      materializePartialBookForRun(runId);
     };
     const updateStage: NonNullable<SynthesisHooks["onStage"]> = (label, detail, progress) => {
       const current = getGenerationRun(runId);
@@ -790,6 +796,48 @@ export const createRepository = (db: SqliteDatabase) => {
         progress: run.progress
       });
     }
+  };
+
+  const recoverInterruptedGenerationRuns = () => {
+    const rows = db.prepare("SELECT * FROM generation_runs WHERE status IN ('queued', 'running') ORDER BY created_at, rowid").all() as Row[];
+    for (const row of rows) {
+      const runId = asString(row.id);
+      materializePartialBookForRun(runId);
+      const run = getGenerationRun(runId);
+      if (!run || (run.status !== "queued" && run.status !== "running")) continue;
+      updateGenerationRunRecord({
+        ...run,
+        status: "failed",
+        progress: Math.max(run.progress, 10),
+        steps: markActiveGenerationStepFailed(run.steps.length ? run.steps : runningGenerationSteps(), interruptedGenerationMessage),
+        error: interruptedGenerationMessage,
+        updatedAt: nowIso()
+      });
+    }
+  };
+
+  const materializePartialBooksForActiveRuns = () => {
+    const rows = db.prepare("SELECT id FROM generation_runs WHERE status IN ('queued', 'running', 'failed') AND book_id IS NOT NULL ORDER BY created_at, rowid").all() as Row[];
+    for (const row of rows) materializePartialBookForRun(asString(row.id));
+  };
+
+  const materializePartialBookForBook = (bookId: string) => {
+    const row = db
+      .prepare("SELECT id FROM generation_runs WHERE book_id = ? AND status IN ('queued', 'running', 'failed') ORDER BY created_at DESC, rowid DESC LIMIT 1")
+      .get(bookId) as Row | undefined;
+    if (row) materializePartialBookForRun(asString(row.id));
+  };
+
+  const materializePartialBookForRun = (runId: string): RepoBook | null => {
+    const run = getGenerationRun(runId);
+    if (!run?.bookId || run.status === "complete") return null;
+    const base = getBaseBook(run.bookId);
+    if (!base) return null;
+
+    const partialBook = buildPartialBookFromArtifacts(base, run);
+    if (!partialBook.parts.length && !partialBook.chapters.length) return null;
+    saveBook(partialBook);
+    return partialBook;
   };
 
   const listTutorThreads = (filters: { bookId?: string; chapterId?: string }, userId = defaultUserId): TutorThread[] => {
@@ -1043,6 +1091,7 @@ export const createRepository = (db: SqliteDatabase) => {
     saveUiState,
     createGenerationRun,
     getGenerationRun,
+    recoverInterruptedGenerationRuns,
     retryFailedGenerationChapters,
     retryGenerationChapter,
     listTutorThreads,
@@ -1228,6 +1277,315 @@ export const createRepository = (db: SqliteDatabase) => {
       .filter(Boolean)
       .join(" ");
   }
+};
+
+type PlannedPartialChapter = {
+  id: string;
+  number: string;
+  order: number;
+  partIndex: number;
+  partId: string;
+  title: string;
+  subtitle: string;
+  files: string[];
+  goals: string[];
+  focus: string;
+  checkpoints: string[];
+  codePath: string;
+  codeLabel: string;
+};
+
+type PartialSectionDraft = {
+  index: number;
+  title: string;
+  body: string;
+};
+
+type PartialRevisionSection = {
+  eyebrow: string;
+  title: string;
+};
+
+const buildPartialBookFromArtifacts = (base: RepoBook, run: GenerationRun): RepoBook => {
+  const orderedArtifacts = [...(run.artifacts ?? [])].sort((a, b) => a.order - b.order);
+  const parts = partialParts(base, orderedArtifacts);
+  const plannedChapters = partialChapterSpecs(base.id, parts, orderedArtifacts);
+  const draftsByKey = new Map<string, PartialSectionDraft[]>();
+  const briefsByKey = new Map<string, Record<string, unknown>>();
+  const revisionsByKey = new Map<string, PartialRevisionSection[]>();
+
+  for (const artifact of orderedArtifacts) {
+    const number = getPayloadString(artifact.payload, "chapterNumber");
+    const key = artifact.chapterId ?? number;
+    if (!key) continue;
+
+    if (artifact.kind === "chapter_brief") {
+      const brief = getPayloadRecord(artifact.payload, "brief");
+      if (brief) {
+        briefsByKey.set(key, brief);
+        if (number) briefsByKey.set(number, brief);
+      }
+    }
+
+    if (artifact.kind === "section_draft") {
+      const body = getPayloadString(artifact.payload, "body").trim();
+      if (!body) continue;
+      const draft = {
+        index: getPayloadNumber(artifact.payload, "sectionIndex") ?? draftsByKey.get(key)?.length ?? 0,
+        title: getPayloadString(artifact.payload, "title") || `Section ${(draftsByKey.get(key)?.length ?? 0) + 1}`,
+        body
+      };
+      const current = draftsByKey.get(key) ?? [];
+      draftsByKey.set(key, [...current.filter((item) => item.index !== draft.index), draft]);
+      if (number) draftsByKey.set(number, draftsByKey.get(key) ?? [draft]);
+    }
+
+    if (artifact.kind === "chapter_revision") {
+      const sections = getPayloadRecords(artifact.payload, "sections").map((section, index) => ({
+        eyebrow: getPayloadString(section, "eyebrow") || `Section ${index + 1}`,
+        title: getPayloadString(section, "title") || `Section ${index + 1}`
+      }));
+      if (sections.length) {
+        revisionsByKey.set(key, sections);
+        if (number) revisionsByKey.set(number, sections);
+      }
+    }
+  }
+
+  const specs = plannedChapters.length ? plannedChapters : inferredPartialChapterSpecs(base.id, parts, orderedArtifacts, draftsByKey, briefsByKey);
+  const chapters = specs
+    .map((spec) => partialChapterFromArtifacts(base.id, spec, run, draftsByKey, briefsByKey, revisionsByKey))
+    .filter((chapter): chapter is BookChapter => Boolean(chapter))
+    .sort((a, b) => a.order - b.order);
+
+  const currentChapterId = base.currentChapterId && chapters.some((chapter) => chapter.id === base.currentChapterId) ? base.currentChapterId : chapters[0]?.id ?? "";
+  const readableChapters = chapters.map((chapter) =>
+    chapter.id === currentChapterId && chapter.status !== "failed" ? { ...chapter, status: "current" as const } : chapter
+  );
+
+  return {
+    ...base,
+    updated: run.status === "failed" ? "생성 중단" : "생성 중",
+    status: base.status,
+    statusLabel: partialBookStatusLabel(run, readableChapters.length),
+    progress: run.progress,
+    currentChapterId,
+    parts,
+    chapters: readableChapters
+  };
+};
+
+const partialParts = (base: RepoBook, artifacts: GenerationArtifact[]): BookPart[] => {
+  const partPlan = [...artifacts].reverse().find((artifact) => artifact.kind === "part_plan");
+  const planned = getPayloadRecords(partPlan?.payload ?? {}, "parts");
+  if (!planned.length) return base.parts;
+  return planned.map((part, index) => ({
+    id: `${base.id}-part-${index + 1}`,
+    bookId: base.id,
+    order: index,
+    title: getPayloadString(part, "title") || `Part ${index + 1}`,
+    summary: getPayloadString(part, "summary") || "생성 중인 대단원입니다."
+  }));
+};
+
+const partialChapterSpecs = (bookId: string, parts: BookPart[], artifacts: GenerationArtifact[]): PlannedPartialChapter[] => {
+  const specs: PlannedPartialChapter[] = [];
+  let fallbackPartIndex = 0;
+
+  for (const artifact of artifacts.filter((item) => item.kind === "chapter_plan")) {
+    const partTitle = getPayloadString(artifact.payload, "part");
+    const matchedPartIndex = parts.findIndex((part) => part.title === partTitle);
+    const partIndex = matchedPartIndex >= 0 ? matchedPartIndex : fallbackPartIndex;
+    fallbackPartIndex += 1;
+    const part = ensurePartialPart(parts, bookId, partIndex, partTitle);
+    const chapters = getPayloadRecords(artifact.payload, "chapters");
+    for (const [chapterIndex, chapter] of chapters.entries()) {
+      const number = `${partIndex + 1}.${chapterIndex + 1}`;
+      specs.push({
+        id: `${bookId}-chapter-${number.replace(".", "-")}`,
+        number,
+        order: partIndex * 10 + chapterIndex,
+        partIndex,
+        partId: part.id,
+        title: getPayloadString(chapter, "title") || `Chapter ${number}`,
+        subtitle: getPayloadString(chapter, "subtitle") || "생성 중인 챕터입니다.",
+        files: getPayloadStrings(chapter, "files"),
+        goals: getPayloadStrings(chapter, "goals"),
+        focus: getPayloadString(chapter, "focus"),
+        checkpoints: getPayloadStrings(chapter, "checkpoints"),
+        codePath: getPayloadString(chapter, "codePath"),
+        codeLabel: getPayloadString(chapter, "codeLabel")
+      });
+    }
+  }
+
+  return specs;
+};
+
+const inferredPartialChapterSpecs = (
+  bookId: string,
+  parts: BookPart[],
+  artifacts: GenerationArtifact[],
+  draftsByKey: Map<string, PartialSectionDraft[]>,
+  briefsByKey: Map<string, Record<string, unknown>>
+): PlannedPartialChapter[] => {
+  const numbers = new Set<string>();
+  for (const artifact of artifacts) {
+    const number = getPayloadString(artifact.payload, "chapterNumber");
+    if (number && (draftsByKey.has(number) || briefsByKey.has(number))) numbers.add(number);
+  }
+
+  return [...numbers].sort(compareChapterNumbers).map((number) => {
+    const [partNumber, chapterNumber] = number.split(".").map((value) => Number(value));
+    const partIndex = Number.isFinite(partNumber) && partNumber > 0 ? partNumber - 1 : 0;
+    const chapterIndex = Number.isFinite(chapterNumber) && chapterNumber > 0 ? chapterNumber - 1 : 0;
+    const part = ensurePartialPart(parts, bookId, partIndex);
+    const brief = briefsByKey.get(number);
+    const title = getPayloadString(brief ?? {}, "title") || `Chapter ${number}`;
+    return {
+      id: `${bookId}-chapter-${number.replace(".", "-")}`,
+      number,
+      order: partIndex * 10 + chapterIndex,
+      partIndex,
+      partId: part.id,
+      title,
+      subtitle: getPayloadString(brief ?? {}, "responsibility") || "생성 중인 챕터입니다.",
+      files: [],
+      goals: [],
+      focus: "",
+      checkpoints: [],
+      codePath: "",
+      codeLabel: ""
+    };
+  });
+};
+
+const partialChapterFromArtifacts = (
+  bookId: string,
+  spec: PlannedPartialChapter,
+  run: GenerationRun,
+  draftsByKey: Map<string, PartialSectionDraft[]>,
+  briefsByKey: Map<string, Record<string, unknown>>,
+  revisionsByKey: Map<string, PartialRevisionSection[]>
+): BookChapter | null => {
+  const drafts = [...(draftsByKey.get(spec.id) ?? draftsByKey.get(spec.number) ?? [])].sort((a, b) => a.index - b.index);
+  if (!drafts.length) return null;
+
+  const revision = revisionsByKey.get(spec.id) ?? revisionsByKey.get(spec.number) ?? [];
+  const brief = briefsByKey.get(spec.id) ?? briefsByKey.get(spec.number) ?? {};
+  const anchors = getPayloadRecords(brief, "codeAnchors") as NonNullable<BookChapter["codeAnchors"]>;
+  const evidence = getPayloadRecords(brief, "evidence") as NonNullable<BookChapter["evidence"]>;
+  const glossary = getPayloadRecords(brief, "glossary") as NonNullable<BookChapter["glossary"]>;
+  const recap = getPayloadRecord(brief, "recap") as BookChapter["recap"] | undefined;
+  const flow = getPayloadRecord(brief, "flow") as BookChapter["flow"] | undefined;
+  const files = spec.files.length ? spec.files : evidence.map((item) => item.filePath).filter(Boolean);
+  const goals = spec.goals.length ? spec.goals : [getPayloadString(brief, "keyQuestion")].filter(Boolean);
+  const fallbackCheckpoints = recap?.changeEntryPoints?.slice(0, 3) ?? ["부분 생성된 본문과 코드 근거를 대조한다."];
+  const checkpoints = spec.checkpoints.length ? spec.checkpoints : fallbackCheckpoints;
+  const firstAnchor = anchors[0];
+  const sections = drafts.map((draft, index) => ({
+    eyebrow: revision[index]?.eyebrow ?? `Draft ${index + 1}`,
+    title: revision[index]?.title ?? draft.title,
+    body: draft.body
+  }));
+  const revised = revision.length > 0;
+
+  return {
+    id: spec.id,
+    bookId,
+    partId: spec.partId,
+    order: spec.order,
+    number: spec.number,
+    title: spec.title,
+    subtitle: spec.subtitle,
+    progress: 0,
+    status: revised ? "complete" : "generating",
+    estimatedMinutes: Math.max(12, Math.min(52, 8 + sections.length * 4 + files.length * 2)),
+    files,
+    goals,
+    sections,
+    code: firstAnchor
+      ? {
+          path: firstAnchor.filePath,
+          label: firstAnchor.claim || spec.codeLabel || "코드 근거",
+          lines: firstAnchor.excerptLines ?? []
+        }
+      : {
+          path: spec.codePath || files[0] || "README.md",
+          label: spec.codeLabel || "코드 근거",
+          lines: ["// 부분 원고에서 코드 앵커를 정리하는 중입니다."]
+        },
+    notes: [
+      { title: "부분 생성본", body: run.status === "failed" ? "생성이 중단되기 전까지 완성된 본문입니다." : "생성 중 먼저 만들어진 본문입니다." },
+      ...(spec.focus ? [{ title: "설계 포인트", body: spec.focus }] : [])
+    ],
+    checkpoints,
+    keyQuestion: getPayloadString(brief, "keyQuestion"),
+    responsibility: getPayloadString(brief, "responsibility"),
+    flow: flow ?? null,
+    codeAnchors: anchors,
+    evidence,
+    glossary,
+    recap: recap ?? { understood: [], changeEntryPoints: [], nextQuestions: [] }
+  };
+};
+
+const ensurePartialPart = (parts: BookPart[], bookId: string, partIndex: number, title = ""): BookPart => {
+  while (parts.length <= partIndex) {
+    const index = parts.length;
+    parts.push({
+      id: `${bookId}-part-${index + 1}`,
+      bookId,
+      order: index,
+      title: index === partIndex && title ? title : `Part ${index + 1}`,
+      summary: "생성 중인 대단원입니다."
+    });
+  }
+  return parts[partIndex];
+};
+
+const partialBookStatusLabel = (run: GenerationRun, readableChapterCount: number) => {
+  if (run.status === "failed") return readableChapterCount > 0 ? "생성 중단 · 일부 읽기 가능" : "생성 실패";
+  if (readableChapterCount > 0) return "일부 읽기 가능";
+  if (run.status === "queued") return "생성 대기 중";
+  const active = currentGenerationStepLabel(run.steps);
+  return active ? `${active} 중` : "생성 중";
+};
+
+const getPayloadRecord = (value: unknown, key: string): Record<string, unknown> | undefined => {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = (value as Record<string, unknown>)[key];
+  return candidate && typeof candidate === "object" && !Array.isArray(candidate) ? (candidate as Record<string, unknown>) : undefined;
+};
+
+const getPayloadRecords = (value: unknown, key: string): Array<Record<string, unknown>> => {
+  if (!value || typeof value !== "object") return [];
+  const candidate = (value as Record<string, unknown>)[key];
+  return Array.isArray(candidate) ? candidate.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item)) : [];
+};
+
+const getPayloadString = (value: unknown, key: string): string => {
+  if (!value || typeof value !== "object") return "";
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === "string" ? candidate : "";
+};
+
+const getPayloadStrings = (value: unknown, key: string): string[] => {
+  if (!value || typeof value !== "object") return [];
+  const candidate = (value as Record<string, unknown>)[key];
+  return Array.isArray(candidate) ? candidate.filter((item): item is string => typeof item === "string" && item.length > 0) : [];
+};
+
+const getPayloadNumber = (value: unknown, key: string): number | undefined => {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined;
+};
+
+const compareChapterNumbers = (left: string, right: string) => {
+  const [leftPart, leftChapter] = left.split(".").map((value) => Number(value));
+  const [rightPart, rightChapter] = right.split(".").map((value) => Number(value));
+  return (leftPart - rightPart) || (leftChapter - rightChapter);
 };
 
 const insertTutorMessage = (db: SqliteDatabase, message: TutorMessage) => {

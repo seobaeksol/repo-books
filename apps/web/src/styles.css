@@ -935,6 +935,12 @@ select {
   text-align: left;
 }
 
+.outline-part button:disabled,
+.outline-part button.is-pending {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
 .outline-part small {
   color: var(--faint);
   font-family: var(--font-mono);

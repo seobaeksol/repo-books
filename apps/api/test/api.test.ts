@@ -594,6 +594,159 @@ describe("Repo Books API", () => {
     expect(lmsMock.calls()).toEqual([{ command: "lms", args: ["get", "missing-local-model"] }]);
   });
 
+  it("marks interrupted background runs failed and exposes readable partial chapters", async () => {
+    const bookId = "partial-generation-book";
+    const runId = "partial-generation-run";
+    const chapterId = `${bookId}-chapter-1-1`;
+    const timestamp = "2026-04-25T09:12:00.000Z";
+    const steps = [
+      { label: "모델 준비", state: "complete", detail: "complete" },
+      { label: "저장소 분석", state: "complete", detail: "complete" },
+      { label: "대단원 설계", state: "complete", detail: "complete" },
+      { label: "소단원 설계", state: "complete", detail: "complete" },
+      { label: "근거 수집", state: "complete", detail: "complete" },
+      { label: "본문 생성", state: "active", detail: "section draft 생성 중" },
+      { label: "챕터 수리", state: "pending", detail: "waiting for revision pass" },
+      { label: "책 일관성 점검", state: "pending", detail: "waiting for coherence pass" }
+    ];
+
+    app.repo.db.prepare(
+      `INSERT INTO books (id, title, subtitle, repo, branch, model, updated, status, status_label, accent, progress, current_chapter_id)
+       VALUES (@id, @title, @subtitle, @repo, @branch, @model, @updated, @status, @statusLabel, @accent, @progress, @currentChapterId)`
+    ).run({
+      id: bookId,
+      title: "sample-service Repo Book",
+      subtitle: "부분 생성 중인 책",
+      repo: "example/sample-service",
+      branch: "main",
+      model: "LM Studio SDK · google/gemma-4-E4B-it",
+      updated: "생성 중",
+      status: "generating",
+      statusLabel: "본문 생성 중",
+      accent: "amber",
+      progress: 55,
+      currentChapterId: ""
+    });
+    app.repo.db.prepare(
+      `INSERT INTO generation_runs (
+        id, user_id, book_id, repo_url, branch, model, context, status, progress, steps_json, outline_json, payload_json, error, created_at, updated_at
+      ) VALUES (
+        @id, @userId, @bookId, @repoUrl, @branch, @model, @context, @status, @progress, @stepsJson, @outlineJson, @payloadJson, @error, @createdAt, @updatedAt
+      )`
+    ).run({
+      id: runId,
+      userId: "local",
+      bookId,
+      repoUrl: "example/sample-service",
+      branch: "main",
+      model: "google/gemma-4-E4B-it",
+      context: "64k",
+      status: "running",
+      progress: 55,
+      stepsJson: JSON.stringify(steps),
+      outlineJson: "[]",
+      payloadJson: JSON.stringify({ repoUrl: "example/sample-service", branch: "main", model: "google/gemma-4-E4B-it", context: "64k", readerLevel: "유지보수자", bookPurpose: "변경 준비", depth: "balanced" }),
+      error: "",
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+    const insertArtifact = app.repo.db.prepare(
+      `INSERT INTO generation_artifacts (id, run_id, chapter_id, kind, sort_order, payload_json, created_at)
+       VALUES (@id, @runId, @chapterId, @kind, @order, @payloadJson, @createdAt)`
+    );
+    [
+      {
+        id: "partial-artifact-part",
+        chapterId: null,
+        kind: "part_plan",
+        order: 0,
+        payload: { parts: [{ title: "Part I. 실행 흐름", summary: "요청 흐름을 먼저 읽는다." }] }
+      },
+      {
+        id: "partial-artifact-plan",
+        chapterId: null,
+        kind: "chapter_plan",
+        order: 1,
+        payload: {
+          part: "Part I. 실행 흐름",
+          chapters: [
+            {
+              title: "서비스 진입점",
+              subtitle: "요청이 앱으로 들어오는 경계를 읽는다.",
+              files: ["src/server.ts", "src/app.ts"],
+              goals: ["진입점과 라우트 등록을 설명한다."],
+              focus: "Fastify 앱 생성 책임을 연결한다.",
+              checkpoints: ["라우트 등록 지점을 확인한다."],
+              codePath: "src/app.ts",
+              codeLabel: "app factory"
+            }
+          ]
+        }
+      },
+      {
+        id: "partial-artifact-brief",
+        chapterId,
+        kind: "chapter_brief",
+        order: 2,
+        payload: {
+          chapterNumber: "1.1",
+          title: "서비스 진입점",
+          brief: {
+            keyQuestion: "요청은 어디에서 앱 경계로 들어오는가?",
+            responsibility: "Fastify 앱 생성과 라우트 등록의 책임을 설명한다.",
+            flow: null,
+            codeAnchors: [{ filePath: "src/app.ts", symbolName: "createApp", lineHint: "L1", claim: "앱 생성 경계", explanation: "라우트 등록이 이 지점에서 시작된다.", excerptLines: ["export function createApp() {}"] }],
+            evidence: [{ filePath: "src/app.ts", role: "앱 생성", usedAsEvidence: "라우트 등록 시작점", outOfScope: "" }],
+            glossary: [],
+            recap: { understood: ["앱 생성 경계를 찾았다."], changeEntryPoints: ["src/app.ts"], nextQuestions: [] }
+          }
+        }
+      },
+      {
+        id: "partial-artifact-section-1",
+        chapterId,
+        kind: "section_draft",
+        order: 3,
+        payload: { chapterNumber: "1.1", sectionIndex: 0, title: "앱 경계", status: "complete", attempts: 1, body: "Fastify 앱은 createApp에서 만들어진다.\n\n라우트 등록은 이 경계를 통해 시작된다." }
+      },
+      {
+        id: "partial-artifact-section-2",
+        chapterId,
+        kind: "section_draft",
+        order: 4,
+        payload: { chapterNumber: "1.1", sectionIndex: 1, title: "라우트 등록", status: "complete", attempts: 1, body: "라우트 파일은 앱 생성 이후 연결된다.\n\n따라서 요청 경계와 도메인 경계를 나눠 읽는다." }
+      },
+      {
+        id: "partial-artifact-revision",
+        chapterId,
+        kind: "chapter_revision",
+        order: 5,
+        payload: { chapterNumber: "1.1", title: "서비스 진입점", status: "drafted", sections: [{ eyebrow: "경계", title: "앱 경계" }, { eyebrow: "흐름", title: "라우트 등록" }], issues: [] }
+      }
+    ].forEach((artifact) => {
+      insertArtifact.run({ ...artifact, runId, payloadJson: JSON.stringify(artifact.payload), createdAt: timestamp });
+    });
+
+    await app.close();
+    await makeApp();
+
+    const recovered = await app.inject({ method: "GET", url: `/api/generation/runs/${runId}` });
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json().generationRun.status).toBe("failed");
+    expect(recovered.json().generationRun.error).toContain("서버가 재시작");
+    expect(recovered.json().book).toMatchObject({ id: bookId, status: "generating", statusLabel: "생성 중단 · 일부 읽기 가능" });
+    expect(recovered.json().book.chapters[0]).toMatchObject({ id: chapterId, title: "서비스 진입점", status: "current" });
+    expect(recovered.json().book.chapters[0].sections).toHaveLength(2);
+
+    const saved = await app.inject({
+      method: "PATCH",
+      url: `/api/reading-state/${bookId}`,
+      payload: { chapterId, progressPercent: 18, scrollY: 120 }
+    });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.json().readingState).toMatchObject({ bookId, chapterId, progressPercent: 18, scrollY: 120 });
+  });
+
   it("rejects meta SDK prose and records failed chapter text without deterministic prose fallback", async () => {
     lmStudioMock.setMode("bad-section-draft");
     const response = await app.inject({
