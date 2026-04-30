@@ -443,7 +443,7 @@ describe("Repo Books web app", () => {
   });
 
   it("renders structured chapter body, evidence, and multiple code anchors", async () => {
-    render(
+    const { container } = render(
       <MemoryRouter initialEntries={["/books/repo-books-book/chapters/chapter-1-2"]}>
         <App />
       </MemoryRouter>
@@ -452,7 +452,10 @@ describe("Repo Books web app", () => {
     expect(await screen.findByRole("heading", { name: "폴더를 대단원으로 바꾸기" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "폴더 책임은 책의 장 구조로 어떻게 바뀌는가?" })).toBeInTheDocument();
     expect(screen.getByText("요구사항에서 책 본문으로 이어지는 흐름")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: /Flowchart: 요구사항에서 책 본문으로 이어지는 흐름/ })).toBeInTheDocument();
     expect(screen.getByText("packages/shared/src/index.ts는 챕터 구조의 public contract를 증명한다.")).toBeInTheDocument();
+    expect(container.querySelector(".syntax-token--keyword")).toBeInTheDocument();
+    expect(container.querySelector(".line-number")?.textContent).toBe("45");
     expect(screen.getByText("BookChapter")).toBeInTheDocument();
   });
 

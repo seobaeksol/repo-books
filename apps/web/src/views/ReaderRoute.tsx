@@ -19,6 +19,8 @@ import type { FormEvent, RefObject } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import type { BookChapter, ReadingState, UIState } from "@repo-books/shared";
+import { FlowChart } from "../components/FlowChart";
+import { HighlightedCodeBlock } from "../components/HighlightedCodeBlock";
 import { api, type BookWithContent, type TutorThreadWithMessages } from "../lib/api";
 import { queryKeys } from "../lib/query";
 import type { MobilePanel } from "../types";
@@ -459,7 +461,7 @@ function BookPage({ book, chapter }: { book: BookWithContent; chapter: BookChapt
             <span>{chapter.flow.title}</span>
           </div>
           <p>{chapter.flow.summary}</p>
-          {chapter.flow.diagram ? <pre className="flow-diagram">{chapter.flow.diagram}</pre> : null}
+          {chapter.flow.diagram ? <FlowChart diagram={chapter.flow.diagram} title={chapter.flow.title} summary={chapter.flow.summary} /> : null}
         </section>
       ) : null}
 
@@ -481,18 +483,12 @@ function BookPage({ book, chapter }: { book: BookWithContent; chapter: BookChapt
                 </div>
                 <p>{anchor.claim}</p>
                 <p>{anchor.explanation}</p>
-                {anchor.excerptLines.length ? (
-                  <pre>
-                    <code>{anchor.excerptLines.join("\n")}</code>
-                  </pre>
-                ) : null}
+                {anchor.excerptLines.length ? <HighlightedCodeBlock lines={anchor.excerptLines} filePath={anchor.filePath} lineHint={anchor.lineHint} /> : null}
               </article>
             ))}
           </div>
         ) : (
-          <pre>
-            <code>{code.lines.join("\n")}</code>
-          </pre>
+          <HighlightedCodeBlock lines={code.lines} filePath={code.path} />
         )}
       </section>
 

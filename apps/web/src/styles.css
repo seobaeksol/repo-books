@@ -1627,7 +1627,7 @@ pre {
   font-size: 0.86rem;
 }
 
-.code-anchor span,
+.code-anchor > div span,
 .code-anchor p {
   margin: 0;
   color: color-mix(in srgb, var(--code-text) 74%, transparent);
@@ -1639,6 +1639,136 @@ pre {
   max-height: 260px;
   border: 1px solid var(--code-border);
   border-radius: 8px;
+}
+
+.highlighted-code {
+  padding: 0;
+  max-width: 100%;
+}
+
+.code-lines {
+  display: block;
+  min-width: max-content;
+  padding: 12px 0;
+}
+
+.code-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 1.65em;
+}
+
+.code-line.has-line-number {
+  grid-template-columns: minmax(3.4rem, auto) minmax(0, 1fr);
+}
+
+.line-number {
+  padding: 0 10px;
+  border-right: 1px solid color-mix(in srgb, var(--code-border) 84%, transparent);
+  color: color-mix(in srgb, var(--code-text) 38%, transparent);
+  text-align: right;
+  user-select: none;
+}
+
+.line-content {
+  display: block;
+  padding: 0 16px;
+  white-space: pre;
+}
+
+.code-line.has-line-number .line-content {
+  padding-left: 12px;
+}
+
+.code-line:hover .line-number {
+  color: color-mix(in srgb, var(--code-text) 58%, transparent);
+}
+
+.syntax-token--comment {
+  color: color-mix(in srgb, var(--code-text) 48%, transparent);
+  font-style: italic;
+}
+
+.syntax-token--keyword {
+  color: #8bdcff;
+  font-weight: 700;
+}
+
+.syntax-token--type,
+.syntax-token--function {
+  color: #b9d7ff;
+}
+
+.syntax-token--string {
+  color: var(--success);
+}
+
+.syntax-token--number,
+.syntax-token--literal {
+  color: var(--warning);
+}
+
+.syntax-token--property {
+  color: #a6e7ee;
+}
+
+.syntax-token--operator {
+  color: color-mix(in srgb, var(--code-text) 62%, transparent);
+}
+
+.flow-chart-shell {
+  margin-top: 12px;
+  max-height: min(620px, 70vh);
+  overflow: auto;
+  border: 1px solid var(--reader-line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--reader-panel) 70%, var(--reader));
+}
+
+.flow-chart {
+  display: block;
+  height: auto;
+  max-width: none;
+  margin: 0 auto;
+}
+
+.flow-chart--vertical {
+  width: min(100%, 560px);
+}
+
+.flow-chart--horizontal {
+  width: auto;
+}
+
+.flow-chart marker path {
+  fill: var(--reader-accent);
+}
+
+.flow-edge-layer path {
+  fill: none;
+  stroke: var(--reader-accent);
+  stroke-linecap: round;
+  stroke-width: 2.4;
+}
+
+.flow-edge-label {
+  fill: var(--reader-muted);
+  font: 0.72rem var(--font-mono);
+}
+
+.flow-node rect {
+  fill: color-mix(in srgb, var(--reader) 86%, var(--surface-2));
+  stroke: var(--reader-line);
+  stroke-width: 1.5;
+}
+
+.flow-node:first-child rect {
+  stroke: var(--reader-accent);
+}
+
+.flow-node text {
+  fill: var(--reader-text);
+  font: 0.82rem var(--font-mono);
 }
 
 .flow-diagram {
@@ -2007,6 +2137,9 @@ code {
 .book-cover:focus-visible,
 .book-cover-tile:focus-visible,
 .book-title-button:focus-visible,
+.flow-chart-shell:focus-visible,
+.flow-diagram:focus-visible,
+.highlighted-code:focus-visible,
 .text-button:focus-visible,
 .primary-action:focus-visible,
 .secondary-action:focus-visible,
