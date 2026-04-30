@@ -150,7 +150,7 @@ export function ReaderRoute({
 
   useEffect(() => {
     if (!book || !chapter) return;
-    const workspace = document.querySelector("#workspace");
+    const workspace = document.querySelector("#reader-scroll") ?? document.querySelector("#workspace");
     const readingState = book.readingState;
     const key = `${book.id}:${chapter.id}:${readingState?.updatedAt ?? ""}`;
     if (!workspace || restoredScrollKey.current === key) return;
@@ -164,7 +164,7 @@ export function ReaderRoute({
 
   useEffect(() => {
     if (!book || !chapter) return;
-    const workspace = document.querySelector("#workspace");
+    const workspace = document.querySelector("#reader-scroll") ?? document.querySelector("#workspace");
     if (!workspace) return;
 
     const saveScroll = () => {
@@ -221,7 +221,7 @@ export function ReaderRoute({
 
   return (
     <section className="reader-view" aria-labelledby="reader-title">
-      <div className="reader-shell">
+      <div className="reader-shell" id="reader-scroll">
         <ReaderToc
           book={book}
           activeChapter={chapter}
@@ -256,7 +256,7 @@ export function ReaderRoute({
           <span>이전 장</span>
         </button>
         <button
-          className="text-button mobile-panel-trigger"
+          className="text-button mobile-panel-trigger toc-panel-trigger"
           type="button"
           aria-label="목차 열기"
           onClick={() => {
@@ -275,7 +275,7 @@ export function ReaderRoute({
           </div>
         </div>
         <button
-          className="text-button mobile-panel-trigger"
+          className="text-button mobile-panel-trigger mentor-panel-trigger"
           type="button"
           aria-label="튜터 주석 열기"
           onClick={() => {

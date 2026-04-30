@@ -202,7 +202,7 @@ export const themePresets: ThemeDefinition[] = [
       "--reader-muted": "#4d5f6b",
       "--reader-line": "#d2dee2",
       "--reader-panel": "rgba(15, 32, 40, 0.045)",
-      "--reader-accent": "#0f8f9c",
+      "--reader-accent": "#076f7b",
       "--reader-font-scale": "1",
       "--reader-line-height": "1.85",
       "--reader-shadow": "0 22px 46px rgba(41, 58, 72, 0.16), inset 10px 0 18px rgba(23, 32, 40, 0.04)",

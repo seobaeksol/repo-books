@@ -35,6 +35,7 @@
   --reader-font-scale: 1;
   --reader-line-height: 1.85;
   --reader-shadow: 0 22px 48px rgba(0, 0, 0, 0.35), inset 10px 0 18px rgba(8, 13, 20, 0.22);
+  --reading-controls-height: 62px;
   --control-bg: #0c1118;
   --control-bg-hover: rgba(255, 255, 255, 0.07);
   --code-bg: #081018;
@@ -384,6 +385,16 @@ svg {
   min-height: 100%;
   margin: 0 auto;
   padding-bottom: 96px;
+}
+
+.app-shell[data-view="reader"] .workspace {
+  overflow: hidden;
+}
+
+.app-shell[data-view="reader"] .app-view {
+  height: 100%;
+  min-height: 0;
+  padding-bottom: 0;
 }
 
 .books-layout {
@@ -1280,12 +1291,24 @@ select {
   font-weight: 760;
 }
 
+.reader-view {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+}
+
 .reader-shell {
   display: grid;
   grid-template-columns: minmax(210px, 250px) minmax(0, 700px) minmax(230px, 280px);
+  grid-template-rows: minmax(0, 1fr);
   gap: 14px;
-  align-items: start;
+  align-items: stretch;
   justify-content: center;
+  min-height: 0;
+  overflow: auto;
+  scroll-padding-block: 16px;
 }
 
 .reader-toc,
@@ -1293,16 +1316,33 @@ select {
   position: sticky;
   top: 0;
   display: grid;
-  align-content: start;
   gap: 14px;
-  max-height: calc(100vh - 98px);
-  overflow: auto;
+  height: 100%;
+  min-height: 0;
+  max-height: 100%;
+  overflow: hidden;
   padding: 14px;
+}
+
+.reader-toc {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.mentor-panel {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.book-page {
+  align-self: start;
 }
 
 .toc-list {
   display: grid;
+  align-content: start;
   gap: 16px;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .toc-part h3 {
@@ -1375,7 +1415,7 @@ select {
 
 .book-page {
   min-width: 0;
-  padding: 42px 48px 30px;
+  padding: clamp(36px, 4.5vw, 52px) clamp(32px, 5vw, 60px) 34px;
   border: 1px solid var(--reader-line);
   border-radius: 8px;
   background:
@@ -1383,6 +1423,13 @@ select {
     var(--reader);
   color: var(--reader-text);
   box-shadow: var(--reader-shadow);
+}
+
+.book-page > :not(.code-panel):not(.evidence-panel) {
+  width: 100%;
+  max-width: 74ch;
+  margin-right: auto;
+  margin-left: auto;
 }
 
 .page-head {
@@ -1491,8 +1538,8 @@ select {
 
 .chapter-section .section-body p {
   margin: 0;
-  color: var(--reader-muted);
-  font-size: calc(1rem * var(--reader-font-scale));
+  color: var(--reader-text);
+  font-size: calc(1.055rem * var(--reader-font-scale));
   line-height: var(--reader-line-height);
 }
 
@@ -1599,7 +1646,7 @@ pre {
   max-height: 260px;
   border: 1px solid var(--reader-line);
   border-radius: 8px;
-  background: color-mix(in srgb, var(--reader-panel) 78%, var(--reader-bg));
+  background: color-mix(in srgb, var(--reader-panel) 78%, var(--reader));
   color: var(--reader-text);
 }
 
@@ -1615,7 +1662,7 @@ pre {
   padding: 12px;
   border: 1px solid var(--reader-line);
   border-radius: 8px;
-  background: color-mix(in srgb, var(--reader-panel) 82%, var(--reader-bg));
+  background: color-mix(in srgb, var(--reader-panel) 82%, var(--reader));
 }
 
 .evidence-table strong {
@@ -1733,7 +1780,14 @@ code {
 .mentor-notes,
 .note-stack {
   display: grid;
+  align-content: start;
   gap: 8px;
+}
+
+.mentor-notes {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .mentor-note {
@@ -1787,15 +1841,15 @@ code {
 }
 
 .reading-controls {
-  position: sticky;
-  bottom: 0;
+  position: relative;
   z-index: 20;
   display: grid;
   grid-template-columns: auto auto minmax(180px, 1fr) auto auto auto auto;
   align-items: center;
   gap: 8px;
+  min-height: var(--reading-controls-height);
   width: min(1120px, calc(100% - 20px));
-  margin: 16px auto 0;
+  margin: 0 auto;
   padding: 10px;
   border-radius: var(--radius-command);
 }
@@ -1981,6 +2035,40 @@ textarea:focus-visible {
   }
 }
 
+@media (max-width: 1180px) {
+  .reader-shell {
+    grid-template-columns: minmax(210px, 250px) minmax(0, 720px);
+  }
+
+  .mentor-panel {
+    display: none;
+  }
+
+  .mentor-panel-trigger {
+    display: inline-flex;
+  }
+
+  .app-shell[data-mobile-panel="mentor"] .mentor-panel {
+    position: fixed;
+    top: auto;
+    right: 10px;
+    bottom: calc(var(--reading-controls-height) + env(safe-area-inset-bottom) + 16px);
+    left: 10px;
+    z-index: 30;
+    display: grid;
+    max-height: min(76vh, 620px);
+    overflow: hidden;
+    border-radius: 14px;
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.025)), var(--command-glass-strong);
+    backdrop-filter: blur(18px) saturate(150%);
+    -webkit-backdrop-filter: blur(18px) saturate(150%);
+  }
+
+  .app-shell[data-mobile-panel="mentor"] .mentor-panel .mobile-only {
+    display: inline-grid;
+  }
+}
+
 @media (max-width: 1024px) {
   .reader-shell {
     grid-template-columns: minmax(0, 1fr);
@@ -1996,12 +2084,12 @@ textarea:focus-visible {
     position: fixed;
     top: auto;
     right: 8px;
-    bottom: 82px;
+    bottom: calc(var(--reading-controls-height) + env(safe-area-inset-bottom) + 14px);
     left: 8px;
     z-index: 30;
     display: grid;
     max-height: min(76vh, 620px);
-    overflow: auto;
+    overflow: hidden;
     border-radius: 14px;
     background: linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.025)), var(--command-glass-strong);
     backdrop-filter: blur(18px) saturate(150%);
@@ -2017,11 +2105,20 @@ textarea:focus-visible {
   }
 
   .reader-view {
-    padding-bottom: 116px;
+    padding-bottom: 0;
+  }
+
+  .book-page {
+    width: min(100%, 760px);
+    justify-self: center;
   }
 }
 
 @media (max-width: 900px) {
+  :root {
+    --reading-controls-height: 84px;
+  }
+
   body {
     overflow: auto;
   }
@@ -2032,8 +2129,24 @@ textarea:focus-visible {
     padding: 8px;
   }
 
+  .app-shell[data-view="reader"] {
+    height: 100dvh;
+    min-height: 100dvh;
+    overflow: hidden;
+  }
+
   .workspace {
     overflow: visible;
+  }
+
+  .app-shell[data-view="reader"] .workspace {
+    overflow: hidden;
+  }
+
+  .app-shell[data-view="reader"] .app-view {
+    height: 100%;
+    min-height: 0;
+    padding-bottom: 0;
   }
 
   .books-layout,
@@ -2088,10 +2201,10 @@ textarea:focus-visible {
   }
 
   .reading-controls {
-    position: fixed;
-    right: 8px;
-    bottom: 8px;
-    left: 8px;
+    position: relative;
+    right: auto;
+    bottom: auto;
+    left: auto;
     width: auto;
     grid-template-columns: repeat(6, minmax(0, 1fr));
     margin: 0;
