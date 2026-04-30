@@ -10,6 +10,7 @@ import {
   type ChapterGlossaryEntry,
   type ChapterRecap,
   type CodeAnchor,
+  type GenerationArtifact,
   type GenerationChapterRun,
   type GenerationOutlinePart,
   type GenerationRun,
@@ -26,7 +27,7 @@ import {
   type StructuredGenerationClient,
   type StructuredGenerationRequest
 } from "./proseAdapter.js";
-import { assertRepoBookQuality } from "./quality.js";
+import { hasGeneratedMetaLanguage, repoBookQualityFailureMessage, validateRepoBookQuality, type RepoBookQualityIssue } from "./quality.js";
 import { slugify } from "./source.js";
 
 type ChapterSpec = {
@@ -73,6 +74,11 @@ export type SynthesisHooks = {
   structuredGenerationClient?: StructuredGenerationClient;
 };
 
+export type SynthesisResumeState = {
+  artifacts?: GenerationArtifact[];
+  book?: RepoBook | null;
+};
+
 export type SynthesizedRepoBook = {
   book: RepoBook;
   outline: GenerationOutlinePart[];
@@ -87,24 +93,28 @@ export async function synthesizeRepoBook(
   payload: PostGenerationOutlinePayload,
   index: RepoIndex,
   hooks: SynthesisHooks = {},
-  requestedBookId?: string
+  requestedBookId?: string,
+  resume?: SynthesisResumeState
 ): Promise<SynthesizedRepoBook> {
   const bookId = requestedBookId ?? `generated-${slugify(index.repoSlug)}-${Date.now()}`;
   hooks.onStage?.("저장소 분석", "archetype, entrypoint, flow evidence를 분석하는 중", 18);
   const analysis = analyzeRepository(index);
   const client = hooks.structuredGenerationClient ?? createStructuredGenerationClient();
-  hooks.onArtifact?.({
-    kind: "repository_analysis",
-    payload: {
-      archetypes: analysis.archetypes,
-      flows: analysis.flows,
-      entryFiles: analysis.entryFiles,
-      verificationFiles: analysis.verificationFiles,
-      configurationFiles: analysis.configurationFiles
-    }
-  });
+  const resumeState = buildResumeState(bookId, index, resume);
+  if (!resumeState.hasRepositoryAnalysis) {
+    hooks.onArtifact?.({
+      kind: "repository_analysis",
+      payload: {
+        archetypes: analysis.archetypes,
+        flows: analysis.flows,
+        entryFiles: analysis.entryFiles,
+        verificationFiles: analysis.verificationFiles,
+        configurationFiles: analysis.configurationFiles
+      }
+    });
+  }
   hooks.onStage?.("대단원 설계", "저장소 전체 arc를 기준으로 part plan 생성", 26);
-  const partSpecs = await planParts(index, analysis, client, payload, hooks);
+  const partSpecs = resumeState.partSpecs ?? (await planParts(index, analysis, client, payload, hooks));
   const parts: BookPart[] = partSpecs.map((part, partIndex) => ({
     id: `${bookId}-part-${partIndex + 1}`,
     bookId,
@@ -116,11 +126,21 @@ export async function synthesizeRepoBook(
   const chapterProse: SynthesizedRepoBook["chapterProse"] = [];
   for (const [partIndex, part] of partSpecs.entries()) {
     hooks.onStage?.("소단원 설계", `${part.title}의 chapter plan 생성`, 32 + Math.round((partIndex / Math.max(1, partSpecs.length)) * 10));
-    const plannedChapters = await planChapters(index, analysis, part, client, payload, hooks);
+    const plannedChapters = resumeState.chapterSpecsByPartTitle.get(part.title) ?? (await planChapters(index, analysis, part, client, payload, hooks));
     const estimatedChapterTotal = Math.max(1, partSpecs.length * targetChaptersPerPart(payload.depth));
     for (const [chapterIndex, chapter] of plannedChapters.entries()) {
       const progressStart = 44 + Math.round((chapters.length / estimatedChapterTotal) * 42);
       const progressEnd = 44 + Math.round(((chapters.length + 1) / estimatedChapterTotal) * 42);
+      const chapterNumber = `${partIndex + 1}.${chapterIndex + 1}`;
+      const chapterId = `${bookId}-chapter-${chapterNumber.replace(".", "-")}`;
+      const resumedChapter = resumeState.completedChaptersById.get(chapterId) ?? resumeState.completedChaptersByNumber.get(chapterNumber);
+      if (resumedChapter) {
+        hooks.onStage?.("본문 생성", `${chapterNumber} ${chapter.title} · 기존 완성 원고 재사용`, progressEnd);
+        const normalized = normalizeResumedChapter(resumedChapter, bookId, parts[partIndex], partIndex, chapterIndex);
+        chapters.push(normalized);
+        chapterProse.push(resumedChapterProse(normalized, resumeState.artifacts));
+        continue;
+      }
       hooks.onStage?.("근거 수집", `${part.title} · ${chapter.title} 근거 정리 시작`, progressStart);
       const result = await makeChapterMultiStage(bookId, parts[partIndex], partIndex, chapterIndex, chapter, index, analysis, payload, client, hooks, {
         start: progressStart,
@@ -131,9 +151,10 @@ export async function synthesizeRepoBook(
     }
   }
   hooks.onStage?.("책 일관성 점검", "용어, recap, 다음 장 연결을 점검하는 중", 91);
-  const coherence = await runBookCoherencePass(index, analysis, parts, chapters, client, payload);
-  hooks.onArtifact?.({ kind: "book_coherence", payload: coherence });
-  const book = repoBookSchema.parse({
+  const coherence = resumeState.bookCoherence ?? (await runBookCoherencePass(index, analysis, parts, chapters, client, payload));
+  if (resumeState.bookCoherence) hooks.onStage?.("책 일관성 점검", "기존 book_coherence artifact 재사용", 91);
+  else hooks.onArtifact?.({ kind: "book_coherence", payload: coherence });
+  let book = repoBookSchema.parse({
     id: bookId,
     title: `${index.repoName}${objectParticle(index.repoName)} 읽는 책`,
     subtitle: `${readerLevelLabel(payload)} 독자를 위해 ${bookPurposeLabel(payload)}에 맞춰 ${depthLabel(payload.depth)} 밀도로 재구성한 ${bookSubtitle(index)}`,
@@ -149,9 +170,23 @@ export async function synthesizeRepoBook(
     parts,
     chapters
   });
-  const qualityIssues = assertRepoBookQuality(book, index);
-  hooks.onArtifact?.({ kind: "quality_issues", payload: { issues: qualityIssues } });
-  hooks.onStage?.("책 일관성 점검", `${chapters.length} chapters checked`, 96);
+  let qualityIssues = validateRepoBookQuality(book, index);
+  const initialErrors = qualityIssues.filter((issue) => issue.severity === "error");
+  if (initialErrors.length > 0) {
+    hooks.onArtifact?.({ kind: "quality_issues", payload: { status: "needs_repair", issues: qualityIssues } });
+    hooks.onStage?.("일관성 교정", `${initialErrors.length} quality issues 교정 중`, 94);
+    const repair = repairBookConsistency(book, index, qualityIssues);
+    book = repair.book;
+    qualityIssues = validateRepoBookQuality(book, index);
+    hooks.onArtifact?.({ kind: "book_consistency_repair", payload: { ...repair.payload, afterIssues: qualityIssues } });
+  }
+  const finalErrors = qualityIssues.filter((issue) => issue.severity === "error");
+  hooks.onArtifact?.({
+    kind: "quality_issues",
+    payload: { status: finalErrors.length > 0 ? "failed" : initialErrors.length > 0 ? "repaired" : "passed", issues: qualityIssues }
+  });
+  if (finalErrors.length > 0) throw new Error(repoBookQualityFailureMessage(finalErrors));
+  hooks.onStage?.("일관성 교정", initialErrors.length > 0 ? `${initialErrors.length} quality issues repaired` : `${chapters.length} chapters checked`, 96);
 
   return {
     book,
@@ -193,8 +228,189 @@ export function generationSteps(index: RepoIndex, prose?: SynthesizedRepoBook["p
     { label: "근거 수집", state: "complete", detail: "chapter briefs, anchors, evidence slices" },
     { label: "본문 생성", state: "complete", detail: proseDetail },
     { label: "챕터 수리", state: "complete", detail: "section repair and revision pass complete" },
-    { label: "책 일관성 점검", state: "complete", detail: "coherence pass complete" }
+    { label: "책 일관성 점검", state: "complete", detail: "coherence pass complete" },
+    { label: "일관성 교정", state: "complete", detail: "quality validation and repair complete" }
   ];
+}
+
+type ResumeState = {
+  artifacts: GenerationArtifact[];
+  hasRepositoryAnalysis: boolean;
+  partSpecs: PartSpec[] | null;
+  chapterSpecsByPartTitle: Map<string, ChapterSpec[]>;
+  completedChaptersById: Map<string, BookChapter>;
+  completedChaptersByNumber: Map<string, BookChapter>;
+  bookCoherence: Record<string, unknown> | null;
+};
+
+function buildResumeState(bookId: string, index: RepoIndex, resume?: SynthesisResumeState): ResumeState {
+  const artifacts = [...(resume?.artifacts ?? [])].sort((a, b) => a.order - b.order);
+  const completeKeys = completedChapterKeys(artifacts);
+  const completedChapters = (resume?.book?.chapters ?? []).filter(
+    (chapter) => chapter.sections.length >= minimumCompleteSections && chapter.status !== "failed" && (completeKeys.has(chapter.id) || completeKeys.has(chapter.number))
+  );
+  return {
+    artifacts,
+    hasRepositoryAnalysis: artifacts.some((artifact) => artifact.kind === "repository_analysis"),
+    partSpecs: resumePartSpecs(bookId, artifacts, resume?.book ?? null),
+    chapterSpecsByPartTitle: resumeChapterSpecsByPartTitle(artifacts, index),
+    completedChaptersById: new Map(completedChapters.map((chapter) => [chapter.id, chapter])),
+    completedChaptersByNumber: new Map(completedChapters.map((chapter) => [chapter.number, chapter])),
+    bookCoherence: resumeBookCoherence(artifacts)
+  };
+}
+
+function resumeBookCoherence(artifacts: GenerationArtifact[]) {
+  const artifact = [...artifacts].reverse().find((item) => item.kind === "book_coherence");
+  return artifact?.payload ?? null;
+}
+
+function resumePartSpecs(bookId: string, artifacts: GenerationArtifact[], book: RepoBook | null): PartSpec[] | null {
+  const partPlan = [...artifacts].reverse().find((artifact) => artifact.kind === "part_plan");
+  const planned = getArtifactRecords(partPlan?.payload ?? {}, "parts");
+  if (planned.length >= 2) {
+    return planned.map((part, index) => ({
+      title: sanitizeTitle(getArtifactString(part, "title")) || `Part ${index + 1}`,
+      summary: sanitizeText(getArtifactString(part, "summary")) || "기존 생성 계획에서 복원한 대단원입니다.",
+      chapters: []
+    }));
+  }
+  if (!book?.parts.length) return null;
+  return book.parts
+    .filter((part) => part.bookId === bookId)
+    .map((part) => ({
+      title: part.title,
+      summary: part.summary,
+      chapters: []
+    }));
+}
+
+function resumeChapterSpecsByPartTitle(artifacts: GenerationArtifact[], index: RepoIndex) {
+  const plans = new Map<string, ChapterSpec[]>();
+  for (const artifact of artifacts.filter((item) => item.kind === "chapter_plan")) {
+    const partTitle = getArtifactString(artifact.payload, "part");
+    if (!partTitle) continue;
+    const chapters = getArtifactRecords(artifact.payload, "chapters")
+      .map((chapter, chapterIndex) => resumeChapterSpec(chapter, chapterIndex, index))
+      .filter((chapter): chapter is ChapterSpec => Boolean(chapter));
+    if (chapters.length > 0) plans.set(partTitle, chapters);
+  }
+  return plans;
+}
+
+function resumeChapterSpec(chapter: Record<string, unknown>, chapterIndex: number, index: RepoIndex): ChapterSpec | null {
+  const files = getArtifactStrings(chapter, "files").filter((path) => resolveFiles(index, [path]).length > 0);
+  const goals = getArtifactStrings(chapter, "goals");
+  const checkpoints = getArtifactStrings(chapter, "checkpoints");
+  const spec = {
+    title: sanitizeTitle(getArtifactString(chapter, "title")) || `Chapter ${chapterIndex + 1}`,
+    subtitle: sanitizeText(getArtifactString(chapter, "subtitle")),
+    files,
+    goals,
+    focus: sanitizeText(getArtifactString(chapter, "focus")),
+    checkpoints,
+    codePath: sanitizeText(getArtifactString(chapter, "codePath")),
+    codeLabel: sanitizeText(getArtifactString(chapter, "codeLabel"))
+  };
+  if (!spec.title || !spec.subtitle || spec.files.length === 0 || spec.goals.length === 0 || !spec.focus || spec.checkpoints.length === 0) return null;
+  return spec;
+}
+
+const minimumCompleteSections = 5;
+
+function completedChapterKeys(artifacts: GenerationArtifact[]) {
+  const draftsByKey = new Map<string, Set<number>>();
+  const revisionsByKey = new Map<string, boolean>();
+
+  for (const artifact of artifacts) {
+    const chapterNumber = getArtifactString(artifact.payload, "chapterNumber");
+    const keys = [artifact.chapterId ?? "", chapterNumber].filter(Boolean);
+    if (keys.length === 0) continue;
+
+    if (artifact.kind === "section_draft" && getArtifactString(artifact.payload, "status") === "complete" && getArtifactString(artifact.payload, "body").trim()) {
+      const sectionIndex = getArtifactNumber(artifact.payload, "sectionIndex") ?? 0;
+      for (const key of keys) {
+        const current = draftsByKey.get(key) ?? new Set<number>();
+        current.add(sectionIndex);
+        draftsByKey.set(key, current);
+      }
+    }
+
+    if (artifact.kind === "chapter_revision") {
+      const status = getArtifactString(artifact.payload, "status");
+      const issues = Array.isArray((artifact.payload as Record<string, unknown>).issues) ? ((artifact.payload as Record<string, unknown>).issues as unknown[]) : [];
+      const sections = getArtifactRecords(artifact.payload, "sections");
+      const complete = status !== "failed" && issues.length === 0 && sections.length >= minimumCompleteSections;
+      for (const key of keys) revisionsByKey.set(key, complete);
+    }
+  }
+
+  const complete = new Set<string>();
+  for (const [key, sectionIndexes] of draftsByKey.entries()) {
+    if (sectionIndexes.size >= minimumCompleteSections && revisionsByKey.get(key)) complete.add(key);
+  }
+  return complete;
+}
+
+function normalizeResumedChapter(chapter: BookChapter, bookId: string, part: BookPart | undefined, partIndex: number, chapterIndex: number): BookChapter {
+  const order = partIndex * 10 + chapterIndex;
+  const number = `${partIndex + 1}.${chapterIndex + 1}`;
+  return {
+    ...chapter,
+    id: `${bookId}-chapter-${number.replace(".", "-")}`,
+    bookId,
+    partId: part?.id ?? `${bookId}-part-${partIndex + 1}`,
+    order,
+    number,
+    progress: order === 0 ? 6 : 0,
+    status: chapter.status === "failed" ? "failed" : order === 0 ? "current" : "draft"
+  };
+}
+
+function resumedChapterProse(
+  chapter: BookChapter,
+  artifacts: GenerationArtifact[]
+): Pick<GenerationChapterRun, "chapterId" | "order" | "title" | "status" | "attempts" | "source" | "lastError"> {
+  const matching = artifacts.filter((artifact) => artifact.chapterId === chapter.id || getArtifactString(artifact.payload, "chapterNumber") === chapter.number);
+  const attempts = matching
+    .filter((artifact) => artifact.kind === "section_draft")
+    .reduce((sum, artifact) => sum + (getArtifactNumber(artifact.payload, "attempts") ?? 0), 0);
+  const source =
+    [...matching].reverse().map((artifact) => getArtifactString(artifact.payload, "source")).find(Boolean) ||
+    "previous generation artifacts";
+  return {
+    chapterId: chapter.id,
+    order: chapter.order,
+    title: chapter.title,
+    status: "complete",
+    attempts: Math.max(1, attempts),
+    source,
+    lastError: null
+  };
+}
+
+function getArtifactRecords(value: unknown, key: string): Array<Record<string, unknown>> {
+  if (!value || typeof value !== "object") return [];
+  const candidate = (value as Record<string, unknown>)[key];
+  return Array.isArray(candidate) ? candidate.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item)) : [];
+}
+
+function getArtifactString(value: unknown, key: string): string {
+  if (!value || typeof value !== "object") return "";
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === "string" ? candidate : "";
+}
+
+function getArtifactStrings(value: unknown, key: string): string[] {
+  if (!value || typeof value !== "object") return [];
+  const candidate = (value as Record<string, unknown>)[key];
+  return Array.isArray(candidate) ? candidate.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim()) : [];
+}
+
+function getArtifactNumber(value: unknown, key: string): number | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined;
 }
 
 async function planParts(
@@ -989,15 +1205,215 @@ async function runBookCoherencePass(
   return response ?? { ...local, status: "failed", error: "LM coherence pass did not return valid JSON." };
 }
 
+function repairBookConsistency(book: RepoBook, index: RepoIndex, issues: RepoBookQualityIssue[]) {
+  const errorsByChapter = new Map<string, RepoBookQualityIssue[]>();
+  for (const issue of issues.filter((item) => item.severity === "error" && item.chapterId)) {
+    const current = errorsByChapter.get(issue.chapterId ?? "") ?? [];
+    current.push(issue);
+    errorsByChapter.set(issue.chapterId ?? "", current);
+  }
+
+  const repairedChapters: Array<{ chapterId: string; title: string; issues: string[]; fields: string[] }> = [];
+  const chapters = book.chapters.map((chapter) => {
+    const chapterIssues = errorsByChapter.get(chapter.id) ?? [];
+    if (chapterIssues.length === 0) return chapter;
+    const repaired = repairChapterConsistency(chapter, index, chapterIssues);
+    repairedChapters.push({
+      chapterId: chapter.id,
+      title: chapter.title,
+      issues: chapterIssues.map((issue) => issue.message),
+      fields: repaired.fields
+    });
+    return repaired.chapter;
+  });
+
+  return {
+    book: repoBookSchema.parse({ ...book, chapters }),
+    payload: {
+      status: "applied",
+      source: "local consistency repair",
+      beforeIssues: issues,
+      repairedChapters
+    }
+  };
+}
+
+function repairChapterConsistency(chapter: BookChapter, index: RepoIndex, issues: RepoBookQualityIssue[]) {
+  const fields = new Set<string>();
+  let next: BookChapter = {
+    ...chapter,
+    files: [...chapter.files],
+    sections: chapter.sections.map((section) => ({ ...section })),
+    code: chapter.code ? { ...chapter.code, lines: [...chapter.code.lines] } : null,
+    notes: chapter.notes.map((note) => ({ ...note })),
+    checkpoints: [...chapter.checkpoints],
+    codeAnchors: (chapter.codeAnchors ?? []).map((anchor) => ({ ...anchor, excerptLines: [...anchor.excerptLines] })),
+    evidence: (chapter.evidence ?? []).map((item) => ({ ...item })),
+    glossary: (chapter.glossary ?? []).map((entry) => ({ ...entry, relatedAnchors: [...entry.relatedAnchors] })),
+    recap: {
+      understood: [...(chapter.recap?.understood ?? [])],
+      changeEntryPoints: [...(chapter.recap?.changeEntryPoints ?? [])],
+      nextQuestions: [...(chapter.recap?.nextQuestions ?? [])]
+    }
+  };
+
+  if (issues.some((issue) => issue.message.startsWith("Chapter references a file that was not indexed"))) {
+    const repairedFiles = repairChapterFiles(next, index);
+    if (repairedFiles.join("\n") !== next.files.join("\n")) fields.add("files");
+    next = { ...next, files: repairedFiles };
+  }
+
+  if (issues.some((issue) => issue.message === "Chapter needs at least two evidence items, or one file plus a symbol/config/test anchor.")) {
+    const repaired = repairChapterEvidence(next, index);
+    for (const field of repaired.fields) fields.add(field);
+    next = repaired.chapter;
+  }
+
+  if (issues.some((issue) => issue.message === "Chapter body leaks generation/test/meta language.")) {
+    const repaired = repairChapterMetaLanguage(next);
+    for (const field of repaired.fields) fields.add(field);
+    next = repaired.chapter;
+  }
+
+  return { chapter: next, fields: Array.from(fields).sort() };
+}
+
+function repairChapterFiles(chapter: BookChapter, index: RepoIndex) {
+  const indexedPaths = new Set(index.files.map((file) => file.path));
+  const candidates = [
+    ...chapter.files,
+    ...(chapter.evidence ?? []).map((item) => item.filePath),
+    ...(chapter.codeAnchors ?? []).map((anchor) => anchor.filePath),
+    chapter.code?.path ?? ""
+  ].filter((path) => indexedPaths.has(path));
+  const repaired = Array.from(new Set(candidates));
+  return repaired.length > 0 ? repaired : index.files.slice(0, 1).map((file) => file.path);
+}
+
+function repairChapterEvidence(chapter: BookChapter, index: RepoIndex) {
+  const fields = new Set<string>();
+  const files = repairChapterFiles(chapter, index).map((path) => findIndexedFile(index, path)).filter((file): file is IndexedFile => Boolean(file));
+  const spec = chapterSpecFromChapter(chapter);
+  const seededEvidence = buildEvidence(files);
+  const seededAnchors = buildCodeAnchors(index, spec, files);
+  const evidence = mergeEvidence(chapter.evidence ?? [], seededEvidence);
+  const codeAnchors = mergeCodeAnchors(chapter.codeAnchors ?? [], seededAnchors);
+  if (evidence.length !== (chapter.evidence ?? []).length) fields.add("evidence");
+  if (codeAnchors.length !== (chapter.codeAnchors ?? []).length) fields.add("codeAnchors");
+  const code = chapter.code ?? selectCodeExcerpt(index, chapter.files[0], "코드 근거");
+  if (!chapter.code && code) fields.add("code");
+  return {
+    chapter: {
+      ...chapter,
+      files: files.length > 0 ? files.map((file) => file.path) : chapter.files,
+      evidence,
+      codeAnchors,
+      code
+    },
+    fields: Array.from(fields)
+  };
+}
+
+function repairChapterMetaLanguage(chapter: BookChapter) {
+  const fields = new Set<string>();
+  const repairText = (value: string, field: string) => {
+    const repaired = repairGeneratedMetaText(value);
+    if (repaired !== value) fields.add(field);
+    return repaired;
+  };
+
+  const repairedSections = chapter.sections.map((section, index) => {
+    const body = ensureRepairedSectionBody(repairText(section.body, `sections[${index}].body`), chapter, index);
+    if (body !== section.body) fields.add(`sections[${index}].body`);
+    return {
+      ...section,
+      eyebrow: repairText(section.eyebrow, `sections[${index}].eyebrow`),
+      title: repairText(section.title, `sections[${index}].title`),
+      body
+    };
+  });
+
+  return {
+    chapter: {
+      ...chapter,
+      keyQuestion: repairText(chapter.keyQuestion ?? "", "keyQuestion"),
+      responsibility: repairText(chapter.responsibility ?? "", "responsibility"),
+      flow: chapter.flow
+        ? {
+            ...chapter.flow,
+            title: repairText(chapter.flow.title, "flow.title"),
+            summary: repairText(chapter.flow.summary, "flow.summary")
+          }
+        : chapter.flow,
+      sections: repairedSections,
+      evidence: (chapter.evidence ?? []).map((item, index) => ({
+        ...item,
+        role: repairText(item.role, `evidence[${index}].role`),
+        usedAsEvidence: repairText(item.usedAsEvidence, `evidence[${index}].usedAsEvidence`),
+        outOfScope: repairText(item.outOfScope, `evidence[${index}].outOfScope`)
+      })),
+      codeAnchors: (chapter.codeAnchors ?? []).map((anchor, index) => ({
+        ...anchor,
+        claim: repairText(anchor.claim, `codeAnchors[${index}].claim`),
+        explanation: repairText(anchor.explanation, `codeAnchors[${index}].explanation`)
+      }))
+    },
+    fields: Array.from(fields)
+  };
+}
+
+function repairGeneratedMetaText(value: string) {
+  return value
+    .replace(/fake\s+OpenAI-compatible/gi, "로컬 모델 호환")
+    .replace(/JSON parsing/gi, "구조화 데이터 처리")
+    .replace(/테스트용\s*응답/g, "검증용 설명")
+    .replace(/프롬프트/g, "입력 조건")
+    .replace(/\b(?:fake|generation|structured|prose|sdk|lm\s*studio)\s+adapter\b/gi, "구조화 계층")
+    .replace(/충분히\s*긴\s*prose/gi, "충분한 본문")
+    .replace(/모델\s*응답/g, "초안")
+    .replace(/생성\s*(?:파이프라인|내부|시스템|단계|결과|응답|엔진|프롬프트)/g, "작성 흐름")
+    .replace(/(?:책|본문|섹션|section|chapter|book)\s*생성기/gi, "작성 흐름")
+    .replace(/```/g, "")
+    .replace(/^#{1,6}\s*/gm, "")
+    .trim();
+}
+
+function ensureRepairedSectionBody(body: string, chapter: BookChapter, sectionIndex: number) {
+  const paths = [...chapter.files, ...(chapter.evidence ?? []).map((item) => item.filePath), ...(chapter.codeAnchors ?? []).map((anchor) => anchor.filePath)].filter(Boolean);
+  if (paths.some((path) => evidencePathMentioned(body, path))) return body;
+  const path = paths[sectionIndex % Math.max(1, paths.length)];
+  if (!path) return body;
+  return `${body}\n\n이 절의 근거는 ${path}에 남아 있으며, 본문 주장은 해당 파일의 코드 앵커와 함께 다시 확인할 수 있다.`;
+}
+
+function mergeEvidence(existing: ChapterEvidence[], seeded: ChapterEvidence[]) {
+  const seen = new Set(existing.map((item) => item.filePath));
+  return [...existing, ...seeded.filter((item) => !seen.has(item.filePath))].slice(0, 5);
+}
+
+function mergeCodeAnchors(existing: CodeAnchor[], seeded: CodeAnchor[]) {
+  const seen = new Set(existing.map((item) => `${item.filePath}:${item.symbolName}:${item.claim}`));
+  return [...existing, ...seeded.filter((item) => !seen.has(`${item.filePath}:${item.symbolName}:${item.claim}`))].slice(0, 8);
+}
+
+function chapterSpecFromChapter(chapter: BookChapter): ChapterSpec {
+  return {
+    title: chapter.title,
+    subtitle: chapter.subtitle,
+    files: chapter.files,
+    goals: chapter.goals.length ? chapter.goals : [chapter.keyQuestion ?? chapter.title],
+    focus: chapter.responsibility || chapter.subtitle,
+    checkpoints: chapter.checkpoints.length ? chapter.checkpoints : chapter.recap?.nextQuestions ?? [],
+    codePath: chapter.code?.path ?? chapter.files[0],
+    codeLabel: chapter.code?.label ?? "코드 근거"
+  };
+}
+
 function validateSectionBody(body: string, section: { title: string; evidenceFiles: string[] }, brief: ChapterBrief) {
   if (body.length < 520) return false;
   if (hasGeneratedMetaLanguage(body)) return false;
   const evidencePaths = new Set([...section.evidenceFiles, ...brief.evidence.map((item) => item.filePath), ...brief.codeAnchors.map((anchor) => anchor.filePath)]);
   return Array.from(evidencePaths).some((path) => path && evidencePathMentioned(body, path));
-}
-
-function hasGeneratedMetaLanguage(body: string) {
-  return /fake\s+OpenAI-compatible|JSON parsing|프롬프트|adapter|모델\s*응답|```|^#{1,6}\s/m.test(body);
 }
 
 function evidencePathMentioned(body: string, path: string) {

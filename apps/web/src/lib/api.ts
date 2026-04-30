@@ -37,12 +37,14 @@ export type TutorThreadWithMessages = TutorThread & {
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (init?.body !== undefined && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+
   const response = await fetch(path, {
     ...init,
-    headers: {
-      "content-type": "application/json",
-      ...(init?.headers ?? {})
-    }
+    headers
   });
 
   if (!response.ok) {
@@ -95,6 +97,8 @@ export const api = {
       body: JSON.stringify(payload)
     }).then((value) => unwrap<UIState>(value, "uiState")),
   getGenerationRun: async (runId: string) => normalizeGenerationResult(await request(`/api/generation/runs/${runId}`)),
+  resumeGenerationRun: async (runId: string) =>
+    normalizeGenerationResult(await request(`/api/generation/runs/${runId}/resume`, { method: "POST" })),
   retryFailedGenerationChapters: async (runId: string) =>
     normalizeGenerationResult(await request(`/api/generation/runs/${runId}/retry-failed-chapters`, { method: "POST" })),
   startGenerationRun: async (payload: GenerationInput) =>

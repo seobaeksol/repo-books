@@ -190,6 +190,12 @@ export const createApp = async (options: CreateAppOptions = {}): Promise<RepoBoo
     return { generationRun, run: generationRun, book };
   });
 
+  app.post("/api/generation/runs/:runId/resume", async (request, reply) => {
+    const { runId } = generationRunParamsSchema.parse(request.params);
+    const result = repo.resumeGenerationRun(runId);
+    return reply.status(result.generationRun.status === "queued" ? 202 : 200).send(result);
+  });
+
   app.get("/api/generation/runs/:runId/events", async (request, reply) => {
     const { runId } = generationRunParamsSchema.parse(request.params);
     if (!repo.getGenerationRun(runId)) return reply.status(404).send({ error: "GENERATION_RUN_NOT_FOUND" });

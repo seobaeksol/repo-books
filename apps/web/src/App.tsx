@@ -111,7 +111,8 @@ const GENERATION_STEPS: Array<{ id: string; label: string; detail: string }> = [
   { id: "brief", label: "근거 수집", detail: "파일 근거, 코드 앵커, glossary 후보 연결" },
   { id: "draft", label: "본문 생성", detail: "section plan과 section draft를 순차 생성" },
   { id: "repair", label: "챕터 수리", detail: "중복 제거, 근거 누락, 흐름 보강" },
-  { id: "coherence", label: "책 일관성 점검", detail: "용어, recap, 다음 장 연결 확인" }
+  { id: "coherence", label: "책 일관성 점검", detail: "용어, recap, 다음 장 연결 확인" },
+  { id: "consistency", label: "일관성 교정", detail: "품질 이슈를 교정하고 재검증" }
 ];
 
 const GENERATION_FORM_DEFAULT: GenerationForm = {
@@ -1089,14 +1090,17 @@ function GenerationProgressRoute({
   const [result, setResult] = useState<GenerationResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [retrying, setRetrying] = useState(false);
+  const [resuming, setResuming] = useState(false);
+  const [pollVersion, setPollVersion] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [runtimeNow, setRuntimeNow] = useState(() => Date.now());
   const displayBook = result?.book ?? null;
   const running = result?.run.status === "queued" || result?.run.status === "running";
   const failedChapterCount = result?.run.chapterRuns?.filter((chapter) => chapter.status === "failed").length ?? 0;
-  const canRetryFailedChapters = Boolean(result?.run.id) && failedChapterCount > 0 && !running && !retrying;
+  const canRetryFailedChapters = Boolean(result?.run.id) && failedChapterCount > 0 && !running && !retrying && !resuming;
+  const canResumeGeneration = Boolean(result?.run.id) && result?.run.status === "failed" && !running && !retrying && !resuming;
   const readableChapter = firstReadableChapter(displayBook);
-  const canReadBook = Boolean(displayBook?.chapters?.length && readableChapter && !retrying);
+  const canReadBook = Boolean(displayBook?.chapters?.length && readableChapter && !retrying && !resuming);
   const readActionLabel = result?.run.status === "complete" ? "읽기 시작" : "부분 읽기";
   const displaySteps: GenerationStep[] =
     result?.run.steps ??
@@ -1133,14 +1137,14 @@ function GenerationProgressRoute({
       cancelled = true;
       if (timer) window.clearTimeout(timer);
     };
-  }, [runId, onGenerated]);
+  }, [runId, onGenerated, pollVersion]);
 
   useEffect(() => {
-    if (!running && !retrying) return;
+    if (!running && !retrying && !resuming) return;
     setRuntimeNow(Date.now());
     const interval = window.setInterval(() => setRuntimeNow(Date.now()), 1000);
     return () => window.clearInterval(interval);
-  }, [running, retrying]);
+  }, [running, retrying, resuming]);
 
   useEffect(() => {
     if (result) setRuntimeNow(Date.now());
@@ -1159,6 +1163,23 @@ function GenerationProgressRoute({
       setError(reason instanceof Error ? reason.message : "실패한 챕터 재시도에 실패했습니다.");
     } finally {
       setRetrying(false);
+    }
+  }
+
+  async function resumeGeneration() {
+    if (!result?.run.id) return;
+    setResuming(true);
+    setRuntimeNow(Date.now());
+    setError(null);
+    try {
+      const nextResult = await api.resumeGenerationRun(result.run.id);
+      setResult(nextResult);
+      setPollVersion((value) => value + 1);
+      if (nextResult.book) onGenerated(nextResult);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "중단된 생성을 이어서 시작하지 못했습니다.");
+    } finally {
+      setResuming(false);
     }
   }
 
@@ -1190,7 +1211,7 @@ function GenerationProgressRoute({
             <Activity />
             <span>Generation run</span>
           </div>
-          <GenerationRunSummary result={result} running={loading || running || retrying} now={runtimeNow} error={error} />
+          <GenerationRunSummary result={result} running={loading || running || retrying || resuming} now={runtimeNow} error={error} />
           <div className="step-list">
             {displaySteps.map((step, index) => {
               const state = step.state;
@@ -1222,6 +1243,10 @@ function GenerationProgressRoute({
             </div>
           ) : null}
           <div className="action-cluster">
+            <button className="primary-action" type="button" onClick={resumeGeneration} disabled={!canResumeGeneration}>
+              {resuming ? <Loader2 className="spin" /> : <RefreshCcw />}
+              <span>{resuming ? "이어 생성 요청 중" : "이어 생성"}</span>
+            </button>
             <button className="secondary-action" type="button" onClick={retryFailedChapters} disabled={!canRetryFailedChapters}>
               {retrying ? <Loader2 className="spin" /> : <RefreshCcw />}
               <span>실패 챕터 재시도</span>
@@ -2307,6 +2332,7 @@ function generationArtifactKindLabel(kind: string) {
     section_draft: "섹션 초안",
     chapter_revision: "챕터 수리",
     book_coherence: "일관성 점검",
+    book_consistency_repair: "일관성 교정",
     quality_issues: "품질 점검"
   };
   return labels[kind] ?? kind;

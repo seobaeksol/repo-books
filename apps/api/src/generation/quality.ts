@@ -7,16 +7,26 @@ export type RepoBookQualityIssue = {
   message: string;
 };
 
-const antiMetaPatterns = [
-  /fake\s+OpenAI-compatible/i,
-  /JSON parsing/i,
-  /테스트용\s*응답/i,
-  /프롬프트/i,
-  /adapter/i,
-  /충분히\s*긴\s*prose/i,
-  /모델\s*응답/i,
-  /생성기/
+const generatedMetaLanguagePatterns: Array<{ label: string; pattern: RegExp }> = [
+  { label: "fake OpenAI-compatible", pattern: /fake\s+OpenAI-compatible/i },
+  { label: "JSON parsing", pattern: /JSON parsing/i },
+  { label: "테스트용 응답", pattern: /테스트용\s*응답/i },
+  { label: "프롬프트", pattern: /프롬프트/i },
+  { label: "generation adapter", pattern: /\b(?:fake|generation|structured|prose|sdk|lm\s*studio)\s+adapter\b/i },
+  { label: "충분히 긴 prose", pattern: /충분히\s*긴\s*prose/i },
+  { label: "모델 응답", pattern: /모델\s*응답/i },
+  { label: "생성 내부", pattern: /생성\s*(?:파이프라인|내부|시스템|단계|결과|응답|엔진|프롬프트)/i },
+  { label: "생성기", pattern: /(?:책|본문|섹션|section|chapter|book)\s*생성기/i },
+  { label: "markdown fence", pattern: /```|^#{1,6}\s/m }
 ];
+
+export function generatedMetaLanguageMatches(text: string) {
+  return generatedMetaLanguagePatterns.filter(({ pattern }) => pattern.test(text)).map(({ label }) => label);
+}
+
+export function hasGeneratedMetaLanguage(text: string) {
+  return generatedMetaLanguageMatches(text).length > 0;
+}
 
 export function validateRepoBookQuality(book: RepoBook, index: RepoIndex): RepoBookQualityIssue[] {
   const indexedPaths = new Set(index.files.map((file) => file.path));
@@ -51,7 +61,7 @@ export function validateRepoBookQuality(book: RepoBook, index: RepoIndex): RepoB
     ]
       .filter(Boolean)
       .join("\n");
-    if (antiMetaPatterns.some((pattern) => pattern.test(text))) {
+    if (hasGeneratedMetaLanguage(text)) {
       issues.push({ severity: "error", chapterId: chapter.id, message: "Chapter body leaks generation/test/meta language." });
     }
     if (!chapter.files.some((path) => text.includes(path)) && !(chapter.codeAnchors ?? []).some((anchor) => text.includes(anchor.filePath))) {
@@ -76,10 +86,15 @@ export function assertRepoBookQuality(book: RepoBook, index: RepoIndex) {
   const issues = validateRepoBookQuality(book, index);
   const errors = issues.filter((issue) => issue.severity === "error");
   if (errors.length > 0) {
-    const message = errors.map((issue) => `${issue.chapterId ?? "book"}: ${issue.message}`).join("; ");
-    throw new Error(`REPO_BOOK_QUALITY_FAILED: ${message}`);
+    throw new Error(repoBookQualityFailureMessage(errors));
   }
   return issues;
+}
+
+export function repoBookQualityFailureMessage(issues: RepoBookQualityIssue[]) {
+  const errors = issues.filter((issue) => issue.severity === "error");
+  const message = errors.map((issue) => `${issue.chapterId ?? "book"}: ${issue.message}`).join("; ");
+  return `REPO_BOOK_QUALITY_FAILED: ${message}`;
 }
 
 function normalizeBody(body: string) {

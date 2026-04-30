@@ -39,6 +39,10 @@ type Row = Record<string, unknown>;
 
 export type RepoBooksRepository = ReturnType<typeof createRepository>;
 
+type ProcessGenerationRunOptions = {
+  resume?: boolean;
+};
+
 const sourceDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(sourceDir, "../../..");
 
@@ -631,6 +635,11 @@ export const createRepository = (db: SqliteDatabase) => {
       .all(runId)
       .map((row) => mapGenerationArtifact(row as Row));
 
+  const nextGenerationArtifactOrder = (runId: string) => {
+    const row = db.prepare("SELECT COALESCE(MAX(sort_order) + 1, 0) AS next_order FROM generation_artifacts WHERE run_id = ?").get(runId) as Row | undefined;
+    return asNumber(row?.next_order);
+  };
+
   const retryFailedGenerationChapters = async (runId: string): Promise<{ generationRun: GenerationRun; book: RepoBook | null; retried: number }> => {
     const run = getGenerationRun(runId);
     if (!run) throw new Error("GENERATION_RUN_NOT_FOUND");
@@ -655,7 +664,35 @@ export const createRepository = (db: SqliteDatabase) => {
     return { ...result, retried: 1 };
   };
 
-  const processGenerationRun = async (runId: string, fallbackUserId = defaultUserId): Promise<{ generationRun: GenerationRun; book: RepoBook | null }> => {
+  const resumeGenerationRun = (runId: string): { generationRun: GenerationRun; book: RepoBook | null } => {
+    const run = getGenerationRun(runId);
+    if (!run) throw new Error("GENERATION_RUN_NOT_FOUND");
+    if (run.status === "queued" || run.status === "running") throw new Error("GENERATION_RUN_BUSY");
+    if (run.status === "complete") return { generationRun: run, book: run.bookId ? getBook(run.bookId, run.userId) : null };
+
+    const queuedAt = nowIso();
+    updateGenerationRunRecord({
+      ...run,
+      status: "queued",
+      progress: Math.max(run.progress, 0),
+      steps: resumeQueuedGenerationSteps(run.steps),
+      error: "",
+      updatedAt: queuedAt
+    });
+    setTimeout(() => {
+      void processGenerationRun(runId, run.userId, { resume: true }).catch(() => undefined);
+    }, 0);
+
+    const generationRun = getGenerationRun(runId);
+    if (!generationRun) throw new Error("GENERATION_RUN_NOT_FOUND");
+    return { generationRun, book: generationRun.bookId ? getBook(generationRun.bookId, generationRun.userId) : null };
+  };
+
+  const processGenerationRun = async (
+    runId: string,
+    fallbackUserId = defaultUserId,
+    options: ProcessGenerationRunOptions = {}
+  ): Promise<{ generationRun: GenerationRun; book: RepoBook | null }> => {
     const row = db.prepare("SELECT * FROM generation_runs WHERE id = ?").get(runId) as Row | undefined;
     if (!row) throw new Error("GENERATION_RUN_NOT_FOUND");
     const userId = asString(row.user_id) || fallbackUserId;
@@ -669,16 +706,17 @@ export const createRepository = (db: SqliteDatabase) => {
     });
     const startedAt = nowIso();
     const startingRun = mapGenerationRun(row, listGenerationChapterRuns(runId), listGenerationArtifacts(runId));
+    const resumeBook = options.resume ? materializePartialBookForRun(runId) ?? (startingRun.bookId ? getBaseBook(startingRun.bookId) : null) : null;
     updateGenerationRunRecord({
       ...startingRun,
       status: "running",
-      progress: 10,
-      steps: runningGenerationSteps(),
+      progress: options.resume ? Math.max(startingRun.progress, 10) : 10,
+      steps: options.resume ? resumeRunningGenerationSteps(startingRun.steps) : runningGenerationSteps(),
       error: "",
       updatedAt: startedAt
     });
-    db.prepare("DELETE FROM generation_artifacts WHERE run_id = ?").run(runId);
-    let artifactOrder = 0;
+    if (!options.resume) db.prepare("DELETE FROM generation_artifacts WHERE run_id = ?").run(runId);
+    let artifactOrder = options.resume ? nextGenerationArtifactOrder(runId) : 0;
     const saveArtifact: NonNullable<SynthesisHooks["onArtifact"]> = (artifact) => {
       insertGenerationArtifact.run({
         id: randomUUID(),
@@ -707,8 +745,13 @@ export const createRepository = (db: SqliteDatabase) => {
 
     try {
       const generationClient = createStructuredGenerationClient();
-      updateStage("모델 준비", `LM Studio 모델 ${payload.model} 확인 중`, 8);
-      await generationClient.prepareModel(payload.model, (detail) => updateStage("모델 준비", detail, 8));
+      const resumeUsesCompletedArtifacts = options.resume && canResumeFromCompletedArtifacts(startingRun, resumeBook);
+      if (resumeUsesCompletedArtifacts) {
+        updateStage("모델 준비", "기존 완성 artifact 재사용", 8);
+      } else {
+        updateStage("모델 준비", `LM Studio 모델 ${payload.model} 확인 중`, 8);
+        await generationClient.prepareModel(payload.model, (detail) => updateStage("모델 준비", detail, 8));
+      }
       updateStage("저장소 분석", "materializing repository and building index", 12);
       const source = materializeRepository(payload.repoUrl, payload.branch);
       const index = buildRepoIndex(source);
@@ -720,7 +763,8 @@ export const createRepository = (db: SqliteDatabase) => {
           onArtifact: saveArtifact,
           structuredGenerationClient: generationClient
         },
-        startingRun.bookId ?? undefined
+        startingRun.bookId ?? undefined,
+        options.resume ? { artifacts: startingRun.artifacts, book: resumeBook } : undefined
       );
       const timestamp = nowIso();
       const chapterRuns: GenerationChapterRun[] = chapterProse.map((chapter) => ({
@@ -1091,6 +1135,7 @@ export const createRepository = (db: SqliteDatabase) => {
     saveUiState,
     createGenerationRun,
     getGenerationRun,
+    resumeGenerationRun,
     recoverInterruptedGenerationRuns,
     retryFailedGenerationChapters,
     retryGenerationChapter,
@@ -1767,13 +1812,52 @@ const generationStageDefaults = [
   ["근거 수집", "waiting for chapter briefs and code anchors"],
   ["본문 생성", "waiting for section drafts"],
   ["챕터 수리", "waiting for revision pass"],
-  ["책 일관성 점검", "waiting for coherence pass"]
+  ["책 일관성 점검", "waiting for coherence pass"],
+  ["일관성 교정", "waiting for consistency repair"]
 ] as const;
+
+const canResumeFromCompletedArtifacts = (run: GenerationRun, book: RepoBook | null) => {
+  const minimumCompleteSections = 5;
+  return Boolean(
+    book?.chapters.length &&
+      book.chapters.every((chapter) => chapter.status !== "failed" && chapter.sections.length >= minimumCompleteSections) &&
+      run.artifacts.some((artifact) => artifact.kind === "part_plan") &&
+      run.artifacts.some((artifact) => artifact.kind === "chapter_plan") &&
+      run.artifacts.some((artifact) => artifact.kind === "book_coherence")
+  );
+};
 
 const pendingGenerationSteps = (): GenerationRun["steps"] =>
   generationStageDefaults.map(([label, detail]) => ({ label, state: "pending", detail }));
 
 const runningGenerationSteps = (): GenerationRun["steps"] => stagedGenerationSteps("모델 준비", "checking LM Studio model");
+
+const resumeQueuedGenerationSteps = (steps: GenerationRun["steps"]): GenerationRun["steps"] => {
+  if (!steps.length) return pendingGenerationSteps();
+  const resumeIndex = resumeStepIndex(steps);
+  return steps.map((step, index) => ({
+    ...step,
+    state: index < resumeIndex ? "complete" : "pending",
+    detail: index === resumeIndex ? "중단 지점부터 이어서 생성 대기 중" : index < resumeIndex ? "complete" : step.detail
+  }));
+};
+
+const resumeRunningGenerationSteps = (steps: GenerationRun["steps"]): GenerationRun["steps"] => {
+  if (!steps.length) return runningGenerationSteps();
+  const resumeIndex = resumeStepIndex(steps);
+  return steps.map((step, index) => ({
+    ...step,
+    state: index < resumeIndex ? "complete" : index === resumeIndex ? "active" : "pending",
+    detail: index === resumeIndex ? "중단 지점부터 이어서 생성 중" : index < resumeIndex ? "complete" : step.detail
+  }));
+};
+
+const resumeStepIndex = (steps: GenerationRun["steps"]) => {
+  const failedIndex = steps.findIndex((step) => step.state === "failed" || step.state === "active");
+  if (failedIndex >= 0) return failedIndex;
+  const firstPendingIndex = steps.findIndex((step) => step.state === "pending");
+  return firstPendingIndex >= 0 ? firstPendingIndex : Math.max(0, steps.length - 1);
+};
 
 const stagedGenerationSteps = (activeLabel: string, activeDetail: string): GenerationRun["steps"] => {
   const activeIndex = Math.max(0, generationStageDefaults.findIndex(([label]) => label === activeLabel));

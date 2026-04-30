@@ -240,7 +240,8 @@ beforeEach(() => {
               { label: "근거 수집", state: "pending", detail: "waiting for chapter briefs and code anchors" },
               { label: "본문 생성", state: "pending", detail: "waiting for section drafts" },
               { label: "챕터 수리", state: "pending", detail: "waiting for revision pass" },
-              { label: "책 일관성 점검", state: "pending", detail: "waiting for coherence pass" }
+              { label: "책 일관성 점검", state: "pending", detail: "waiting for coherence pass" },
+              { label: "일관성 교정", state: "pending", detail: "waiting for consistency repair" }
             ],
             outline: [],
             chapterRuns: [],
@@ -272,7 +273,8 @@ beforeEach(() => {
               { label: "근거 수집", state: "complete", detail: "complete" },
               { label: "본문 생성", state: "complete", detail: "complete" },
               { label: "챕터 수리", state: "complete", detail: "complete" },
-              { label: "책 일관성 점검", state: "complete", detail: "coherence pass complete" }
+              { label: "책 일관성 점검", state: "complete", detail: "coherence pass complete" },
+              { label: "일관성 교정", state: "complete", detail: "quality validation and repair complete" }
             ],
             outline: [],
             chapterRuns: [],
@@ -314,7 +316,8 @@ beforeEach(() => {
               { label: "근거 수집", state: "active", detail: "chapter brief 생성 중" },
               { label: "본문 생성", state: "pending", detail: "waiting for section drafts" },
               { label: "챕터 수리", state: "pending", detail: "waiting for revision pass" },
-              { label: "책 일관성 점검", state: "pending", detail: "waiting for coherence pass" }
+              { label: "책 일관성 점검", state: "pending", detail: "waiting for coherence pass" },
+              { label: "일관성 교정", state: "pending", detail: "waiting for consistency repair" }
             ],
             outline: [],
             chapterRuns: [],
@@ -346,7 +349,8 @@ beforeEach(() => {
               { label: "근거 수집", state: "complete", detail: "complete" },
               { label: "본문 생성", state: "failed", detail: "서버가 재시작되어 백그라운드 책 생성 작업이 중단되었습니다." },
               { label: "챕터 수리", state: "pending", detail: "waiting for revision pass" },
-              { label: "책 일관성 점검", state: "pending", detail: "waiting for coherence pass" }
+              { label: "책 일관성 점검", state: "pending", detail: "waiting for coherence pass" },
+              { label: "일관성 교정", state: "pending", detail: "waiting for consistency repair" }
             ],
             outline: [],
             chapterRuns: [],
