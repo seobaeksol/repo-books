@@ -16,7 +16,7 @@ import {
   X
 } from "lucide-react";
 import type { FormEvent, RefObject } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import type { BookChapter, ReadingState, UIState } from "@repo-books/shared";
 import { FlowChart } from "../components/FlowChart";
@@ -95,6 +95,12 @@ export function ReaderRoute({
   const tocPanelRef = useRef<HTMLElement>(null);
   const mentorPanelRef = useRef<HTMLElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  useLayoutEffect(() => {
+    document.body.scrollTop = 0;
+    document.documentElement.scrollTop = 0;
+    document.getElementById("workspace")?.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  }, [bookId, chapterId]);
 
   useEffect(() => {
     if (book) onBookLoaded(book);

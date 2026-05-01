@@ -459,6 +459,36 @@ describe("Repo Books web app", () => {
     expect(screen.getByText("BookChapter")).toBeInTheDocument();
   });
 
+  it("resets the outer workspace scroll when entering the reader", async () => {
+    const scrollTo = vi.mocked(HTMLElement.prototype.scrollTo);
+
+    render(
+      <MemoryRouter initialEntries={["/books/repo-books-book/chapters/chapter-1-2"]}>
+        <App />
+      </MemoryRouter>
+    );
+
+    expect(await screen.findByRole("heading", { name: "폴더를 대단원으로 바꾸기" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(scrollTo).toHaveBeenCalledWith({ top: 0, left: 0, behavior: "auto" });
+    });
+  });
+
+  it("keeps the generation screen focused on new book inputs without previous outlines", async () => {
+    render(
+      <MemoryRouter initialEntries={["/generation"]}>
+        <App />
+      </MemoryRouter>
+    );
+
+    expect(await screen.findByRole("heading", { name: "기술서 목차 생성" })).toBeInTheDocument();
+    expect(screen.getByLabelText("저장소 URL 또는 로컬 경로")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "책의 목차" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /폴더를 대단원으로 바꾸기/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "읽기 시작" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "읽기" })).not.toBeInTheDocument();
+  });
+
   it("submits model, reader level, and book purpose generation options", async () => {
     const user = userEvent.setup();
     render(

@@ -279,7 +279,7 @@ function AppContent() {
       onCustomThemeChange={updateCustomTheme}
       goToLibrary={goToLibrary}
       goToGeneration={goToGeneration}
-      goToReader={goToReader}
+      goToReader={currentView === "generation" ? undefined : goToReader}
     >
       {error ? <div className="app-error content-surface">{error}</div> : null}
       <Routes>
@@ -301,9 +301,7 @@ function AppContent() {
           path="/generation"
           element={
             <GenerationView
-              activeBook={activeBook}
               onBack={goToLibrary}
-              onReadBook={(bookId, chapterId) => void openBook(bookId, chapterId)}
               onGenerated={rememberGenerationResult}
             />
           }

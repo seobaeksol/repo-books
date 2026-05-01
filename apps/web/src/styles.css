@@ -743,9 +743,11 @@ svg {
 
 .generation-grid {
   display: grid;
-  grid-template-columns: minmax(260px, 0.74fr) minmax(0, 1.35fr) minmax(260px, 0.7fr);
+  grid-template-columns: minmax(420px, 1fr) minmax(300px, 380px);
   gap: 14px;
   align-items: start;
+  width: min(1120px, 100%);
+  margin: 0 auto;
 }
 
 .generation-progress-grid {
@@ -778,7 +780,6 @@ svg {
   line-height: 1.1;
 }
 
-.repo-form,
 .builder-panel {
   display: grid;
   gap: 12px;
@@ -2155,14 +2156,13 @@ textarea:focus-visible {
 
 @media (max-width: 1280px) {
   .generation-grid {
-    grid-template-columns: minmax(230px, 280px) minmax(0, 1fr);
+    grid-template-columns: minmax(360px, 1fr) minmax(280px, 360px);
   }
 
   .generation-progress-grid {
     grid-template-columns: minmax(280px, 0.86fr) minmax(0, 1.14fr);
   }
 
-  .generation-grid > .runtime-panel,
   .generation-grid > .prompt-panel {
     grid-column: 2;
   }
@@ -2378,6 +2378,10 @@ textarea:focus-visible {
     border-radius: var(--radius-command);
   }
 
+  .mobile-library-nav.is-two-up {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .app-shell[data-view="reader"] .mobile-library-nav {
     display: none;
   }
@@ -2438,6 +2442,10 @@ textarea:focus-visible {
 
   .builder-panel h1 {
     font-size: 1.42rem;
+  }
+
+  .custom-prompt-textarea {
+    min-height: 160px;
   }
 
   .run-status-meta {

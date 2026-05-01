@@ -85,7 +85,7 @@ export function AppFrame({
         <div className="app-view">{children}</div>
       </main>
 
-      <nav className="mobile-library-nav command-surface" aria-label="모바일 책장 탐색">
+      <nav className={`mobile-library-nav command-surface ${goToReader ? "" : "is-two-up"}`} aria-label="모바일 책장 탐색">
         <button
           className={`mobile-nav-button ${location.pathname.startsWith("/library") ? "active" : ""}`}
           type="button"
@@ -106,17 +106,18 @@ export function AppFrame({
           <Plus />
           <span>새 책</span>
         </button>
-        <button
-          className={`mobile-nav-button ${location.pathname.startsWith("/books/") ? "active" : ""}`}
-          type="button"
-          onClick={goToReader}
-          disabled={!goToReader}
-          aria-current={location.pathname.startsWith("/books/") ? "page" : undefined}
-          aria-label="읽기"
-        >
-          <BookOpen />
-          <span>읽기</span>
-        </button>
+        {goToReader ? (
+          <button
+            className={`mobile-nav-button ${location.pathname.startsWith("/books/") ? "active" : ""}`}
+            type="button"
+            onClick={goToReader}
+            aria-current={location.pathname.startsWith("/books/") ? "page" : undefined}
+            aria-label="읽기"
+          >
+            <BookOpen />
+            <span>읽기</span>
+          </button>
+        ) : null}
       </nav>
     </div>
   );

@@ -1,6 +1,6 @@
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { BookOpenCheck, ChevronLeft, Loader2, MessageSquareText, RefreshCcw, Sparkles } from "lucide-react";
+import { ChevronLeft, Loader2, MessageSquareText, RefreshCcw, Sparkles } from "lucide-react";
 import type { FormEvent } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -12,20 +12,15 @@ import {
   type LmStudioModelOption
 } from "@repo-books/shared";
 import { GENERATION_FORM_DEFAULT } from "../constants";
-import { api, type BookWithContent, type GenerationResult } from "../lib/api";
+import { api, type GenerationResult } from "../lib/api";
 import { queryKeys } from "../lib/query";
-import { firstChapter, lmStudioModelDescription, lmStudioModelLabel } from "../utils/appHelpers";
-import { OutlinePreview } from "./OutlinePreview";
+import { lmStudioModelDescription, lmStudioModelLabel } from "../utils/appHelpers";
 
 export function GenerationView({
-  activeBook,
   onBack,
-  onReadBook,
   onGenerated
 }: {
-  activeBook: BookWithContent | null;
   onBack: () => void;
-  onReadBook: (bookId: string, chapterId?: string) => void;
   onGenerated: (result: GenerationResult) => void;
 }) {
   const navigate = useNavigate();
@@ -37,8 +32,6 @@ export function GenerationView({
   const [lmStudioModelsLoading, setLmStudioModelsLoading] = useState(false);
   const [lmStudioModelError, setLmStudioModelError] = useState<string | null>(null);
   const modelEditedRef = useRef(false);
-  const displayBook = activeBook;
-  const canReadBook = Boolean(displayBook?.chapters?.length) && !running;
   const selectedLmStudioModel = lmStudioModels.find((option) => option.modelKey === form.model);
   const selectedPresetModel = GENERATION_MODEL_OPTIONS.find((option) => option.value === form.model);
   const modelOptions = lmStudioModels.length
@@ -116,145 +109,113 @@ export function GenerationView({
           <span className="state-dot state-dot--draft" />
           <strong>목차 생성</strong>
         </div>
-        <button
-          className="primary-action"
-          type="button"
-          onClick={() => displayBook && onReadBook(displayBook.id, displayBook.currentChapterId ?? firstChapter(displayBook)?.id)}
-          disabled={!canReadBook}
-        >
-          <BookOpenCheck />
-          <span>읽기 시작</span>
+        <button className="primary-action" type="submit" form="generation-form" disabled={running}>
+          {running ? <Loader2 className="spin" /> : <Sparkles />}
+          <span>{running ? "요청 중" : "책 생성"}</span>
         </button>
       </div>
 
-      <div className="generation-grid">
+      <form id="generation-form" className="generation-grid" onSubmit={runGenerate}>
         <aside className="builder-panel content-surface" aria-labelledby="generation-title">
           <div className="screen-kicker">
             <span className="state-dot state-dot--draft" />
-            <span>TOC builder</span>
+            <span>Book setup</span>
             <span>{running ? "generating" : "drafting"}</span>
           </div>
           <h1 id="generation-title">기술서 목차 생성</h1>
-          <p className="builder-summary">저장소를 책처럼 읽을 수 있도록 목차와 챕터 흐름을 만듭니다.</p>
-          <form className="repo-form" onSubmit={runGenerate}>
-            <div className="form-section">
-              <span className="form-section-title">저장소</span>
-              <label htmlFor="generation-repo">저장소 URL 또는 로컬 경로</label>
+          <p className="builder-summary">저장소를 분석해 새 기술서의 목차와 챕터 흐름을 생성합니다. 생성이 시작되면 진행 화면으로 이동합니다.</p>
+          <div className="form-section">
+            <span className="form-section-title">저장소</span>
+            <label htmlFor="generation-repo">저장소 URL 또는 로컬 경로</label>
+            <input
+              id="generation-repo"
+              type="text"
+              value={form.repositoryUrl}
+              placeholder="https://github.com/owner/repo 또는 /local/path"
+              onChange={(event) => setForm({ ...form, repositoryUrl: event.target.value })}
+              required
+            />
+            <label htmlFor="model-select">LM Studio 모델</label>
+            <div className="model-input-row">
               <input
-                id="generation-repo"
+                id="model-select"
+                list="model-presets"
                 type="text"
-                value={form.repositoryUrl}
-                placeholder="https://github.com/owner/repo 또는 /local/path"
-                onChange={(event) => setForm({ ...form, repositoryUrl: event.target.value })}
+                value={form.model}
+                aria-describedby="model-select-hint"
+                onChange={(event) => {
+                  modelEditedRef.current = true;
+                  setForm({ ...form, model: event.target.value });
+                }}
                 required
               />
-              <label htmlFor="model-select">LM Studio 모델</label>
-              <div className="model-input-row">
-                <input
-                  id="model-select"
-                  list="model-presets"
-                  type="text"
-                  value={form.model}
-                  aria-describedby="model-select-hint"
-                  onChange={(event) => {
-                    modelEditedRef.current = true;
-                    setForm({ ...form, model: event.target.value });
-                  }}
-                  required
-                />
-                <button
-                  className="model-refresh-button"
-                  type="button"
-                  aria-label="LM Studio 모델 목록 새로고침"
-                  title="LM Studio 모델 목록 새로고침"
-                  onClick={() => loadLmStudioModels(true)}
-                  disabled={lmStudioModelsLoading}
-                >
-                  {lmStudioModelsLoading ? <Loader2 className="spin" /> : <RefreshCcw />}
-                </button>
-              </div>
-              <datalist id="model-presets">
-                {modelOptions.map((option) => (
-                  <option key={option.value} value={option.value} label={option.label} />
-                ))}
-              </datalist>
-              <p className="field-hint" id="model-select-hint">{modelDescription}</p>
-            </div>
-            <div className="form-section">
-              <span className="form-section-title">책 설정</span>
-              <label htmlFor="reader-level">독자 수준</label>
-              <select
-                id="reader-level"
-                value={form.readerLevel}
-                aria-describedby="reader-level-hint"
-                onChange={(event) => {
-                  const readerLevel = event.target.value;
-                  setForm({ ...form, readerLevel, audience: readerLevel });
-                }}
-              >
-                {READER_LEVEL_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              <p className="field-hint" id="reader-level-hint">{selectedReaderLevel.description}</p>
-              <label htmlFor="book-purpose">책의 목적</label>
-              <select
-                id="book-purpose"
-                value={form.bookPurpose}
-                aria-describedby="book-purpose-hint"
-                onChange={(event) => setForm({ ...form, bookPurpose: event.target.value })}
-              >
-                {BOOK_PURPOSE_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              <p className="field-hint" id="book-purpose-hint">{selectedBookPurpose.description}</p>
-              <label htmlFor="generation-depth">생성 깊이</label>
-              <select id="generation-depth" value={form.depth} aria-describedby="generation-depth-hint" onChange={(event) => setForm({ ...form, depth: event.target.value })}>
-                {GENERATION_DEPTH_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              <p className="field-hint" id="generation-depth-hint">{selectedDepth.description}</p>
-            </div>
-            <div className="action-cluster">
-              <button className="primary-action" type="submit" disabled={running}>
-                {running ? <Loader2 className="spin" /> : <Sparkles />}
-                <span>{running ? "요청 중" : "책 생성"}</span>
-              </button>
               <button
-                className="secondary-action"
+                className="model-refresh-button"
                 type="button"
-                onClick={() => displayBook && onReadBook(displayBook.id, displayBook.currentChapterId ?? firstChapter(displayBook)?.id)}
-                disabled={!canReadBook}
+                aria-label="LM Studio 모델 목록 새로고침"
+                title="LM Studio 모델 목록 새로고침"
+                onClick={() => loadLmStudioModels(true)}
+                disabled={lmStudioModelsLoading}
               >
-                <BookOpenCheck />
-                <span>읽기 시작</span>
+                {lmStudioModelsLoading ? <Loader2 className="spin" /> : <RefreshCcw />}
               </button>
             </div>
-          </form>
-          {error ? <p className="form-error">{error}</p> : null}
-        </aside>
-
-        <section className="outline-panel" aria-labelledby="outline-title">
-          <div className="section-heading">
-            <div>
-              <p className="eyebrow">Generated outline</p>
-              <h2 id="outline-title">책의 목차</h2>
-            </div>
-            <span className="outline-confidence">
-              <span className="state-dot state-dot--ready" />
-              indexed coherent
-            </span>
+            <datalist id="model-presets">
+              {modelOptions.map((option) => (
+                <option key={option.value} value={option.value} label={option.label} />
+              ))}
+            </datalist>
+            <p className="field-hint" id="model-select-hint">{modelDescription}</p>
           </div>
-          <OutlinePreview book={displayBook} onReadBook={onReadBook} />
-        </section>
+          <div className="form-section">
+            <span className="form-section-title">책 설정</span>
+            <label htmlFor="reader-level">독자 수준</label>
+            <select
+              id="reader-level"
+              value={form.readerLevel}
+              aria-describedby="reader-level-hint"
+              onChange={(event) => {
+                const readerLevel = event.target.value;
+                setForm({ ...form, readerLevel, audience: readerLevel });
+              }}
+            >
+              {READER_LEVEL_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <p className="field-hint" id="reader-level-hint">{selectedReaderLevel.description}</p>
+            <label htmlFor="book-purpose">책의 목적</label>
+            <select
+              id="book-purpose"
+              value={form.bookPurpose}
+              aria-describedby="book-purpose-hint"
+              onChange={(event) => setForm({ ...form, bookPurpose: event.target.value })}
+            >
+              {BOOK_PURPOSE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <p className="field-hint" id="book-purpose-hint">{selectedBookPurpose.description}</p>
+            <label htmlFor="generation-depth">생성 깊이</label>
+            <select id="generation-depth" value={form.depth} aria-describedby="generation-depth-hint" onChange={(event) => setForm({ ...form, depth: event.target.value })}>
+              {GENERATION_DEPTH_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <p className="field-hint" id="generation-depth-hint">{selectedDepth.description}</p>
+          </div>
+          {error ? (
+            <p className="form-error" role="alert">
+              {error}
+            </p>
+          ) : null}
+        </aside>
 
         <aside className="prompt-panel panel-surface" aria-labelledby="custom-prompt-title">
           <div className="section-title" id="custom-prompt-title">
@@ -289,7 +250,7 @@ export function GenerationView({
             </div>
           </dl>
         </aside>
-      </div>
+      </form>
     </section>
   );
 }
